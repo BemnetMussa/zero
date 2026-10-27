@@ -1,9 +1,10 @@
+import argparse
 import os
 import shutil
 import time
 import torch
 
-from tabula.selfplay.worker import SelfPlayWorker, DEFAULT_SIMULATIONS, DEFAULT_RES_BLOCKS
+from tabula.selfplay.worker import SelfPlayWorker, DEFAULT_SIMULATIONS, DEFAULT_RES_BLOCKS, FAST_SIMULATIONS, FULL_SEARCH_P
 from tabula.train.train import train
 from tabula.evaluate.arena import Arena
 from tabula.watch.live import LiveBoard
@@ -59,23 +60,25 @@ def archive_v01_data_if_needed():
     print(f"[v0.2] Archived {moved} v0.1 self-play files → {V01_DATA_ARCHIVE}/")
 
 
-def main():
+def main(max_iter=None, num_games=5, arena_games=20, enable_tui=True):
     champ_path = CHAMP_PATH
     chall_path = CHALL_PATH
 
     archive_v01_data_if_needed()
 
-    live = LiveBoard(enable_tui=True)
+    live = LiveBoard(enable_tui=enable_tui)
     thermal = ThermalGuard(warm_threshold=72.0, emergency_threshold=80.0, target_cool_temp=62.0, cooldown_sleep_sec=2.0)
     iteration = get_next_iteration()
+    start_iteration = iteration
+    finished = 0
 
     print(
-        f"[Zero v0.2] {DEFAULT_RES_BLOCKS} ResBlocks | "
-        f"self-play {DEFAULT_SIMULATIONS} sims | arena {ARENA_SIMULATIONS} sims | "
-        f"perspective encoding | cosine LR"
+        f"[Zero v0.3] {DEFAULT_RES_BLOCKS} ResBlocks | "
+        f"self-play {DEFAULT_SIMULATIONS}/{FAST_SIMULATIONS} sims (p={FULL_SEARCH_P}) | "
+        f"arena {ARENA_SIMULATIONS} sims | playout cap + prune + LATE"
     )
 
-    # We loop forever, generating data, training, and evaluating
+    # We loop forever (or until max_iter), generating data, training, and evaluating
     while True:
         # Pre-check thermals
         thermal.check_and_cool()
@@ -95,8 +98,6 @@ def main():
             num_res_blocks=DEFAULT_RES_BLOCKS,
         )
         
-        # We generate a few games per iteration to keep it fast for laptops
-        num_games = 5
         all_data = []
         
         for g in range(num_games):
@@ -134,7 +135,9 @@ def main():
         print(f"======================================")
         
         # If there's no champion yet, skip arena and just promote the challenger
-        if not os.path.exists(champ_path):
+        if arena_games <= 0:
+            print("Arena skipped (--arena-games 0).")
+        elif not os.path.exists(champ_path):
             print("No champion found. Promoting the first trained network to Champion!")
             shutil.copy(chall_path, champ_path)
             live.note_match(1.0, 0, True, first=True)
@@ -146,7 +149,7 @@ def main():
                 num_simulations=ARENA_SIMULATIONS,
                 num_res_blocks=DEFAULT_RES_BLOCKS,
             )
-            promoted = arena.evaluate(num_games=20, win_threshold=0.55, live=live, hold=0.02)
+            promoted = arena.evaluate(num_games=arena_games, win_threshold=0.55, live=live, hold=0.02)
             live.note_match(
                 arena.last_win_rate,
                 arena.last_games,
@@ -159,11 +162,27 @@ def main():
         print(f"\nIteration {iteration} complete. Cooling down 10 seconds before next cycle...")
         thermal.rest(10.0)
         thermal.check_and_cool()
+        finished += 1
         iteration += 1
+        if max_iter is not None and finished >= max_iter:
+            print(f"[Zero] Stopped after {finished} iteration(s) (started at {start_iteration}).")
+            break
+
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Zero self-play / train / arena loop")
+    parser.add_argument("--max-iter", type=int, default=None, help="stop after this many iterations")
+    parser.add_argument("--games", type=int, default=5, help="self-play games per iteration")
+    parser.add_argument("--arena-games", type=int, default=20, help="arena games per iteration")
+    parser.add_argument("--no-tui", action="store_true", help="disable the live TUI")
+    args = parser.parse_args()
     try:
-        main()
+        main(
+            max_iter=args.max_iter,
+            num_games=args.games,
+            arena_games=args.arena_games,
+            enable_tui=not args.no_tui,
+        )
     except KeyboardInterrupt:
         import sys
         sys.stdout.write("\033[?25h\n\n[Zero] Pipeline paused cleanly by user.\n")

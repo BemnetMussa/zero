@@ -17,6 +17,9 @@ MATERIAL_SCALE = 6.0
 # for a network that still cannot find mate.
 ADJUDICATE_LEAD = 7
 ADJUDICATE_PLIES = 6
+# v0.3: a winning side that repeats into a draw is hiding, not drawing fairly.
+CONTEMPT_LEAD = 3
+REPETITION_CONTEMPT = 0.35
 
 _VALUE = {
     chess.PAWN: 1,
@@ -43,6 +46,25 @@ def material_value(board) -> float:
     return float(np.tanh(material_white(board) / MATERIAL_SCALE))
 
 
+def is_repetition_draw(outcome) -> bool:
+    if outcome is None or outcome.winner is not None:
+        return False
+    term = outcome.termination
+    return term in (chess.Termination.THREEFOLD_REPETITION, chess.Termination.FIVEFOLD_REPETITION)
+
+
+def repetition_draw_reward(board) -> float:
+    """White-perspective reward for a repetition draw.
+
+    Even games stay 0. If one side leads by CONTEMPT_LEAD pawns or more,
+    that side is penalized so hiding in a threefold is not a free 0.0.
+    """
+    lead = material_white(board)
+    if abs(lead) < CONTEMPT_LEAD:
+        return 0.0
+    return -REPETITION_CONTEMPT if lead > 0 else REPETITION_CONTEMPT
+
+
 def score_game(board, outcome, stop, adjudicate_scale=1.0):
     """Reward from White's point of view, plus a short result label and why it ended.
 
@@ -59,6 +81,9 @@ def score_game(board, outcome, stop, adjudicate_scale=1.0):
         return reward, result, outcome.termination.name
 
     if outcome is not None and outcome.winner is None:
+        if is_repetition_draw(outcome):
+            reward = repetition_draw_reward(board)
+            return reward, "DRAW", outcome.termination.name
         return 0.0, "DRAW", outcome.termination.name
 
     reward = material_value(board) * float(adjudicate_scale)

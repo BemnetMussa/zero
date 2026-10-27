@@ -13,6 +13,10 @@ from tabula.game.score import ADJUDICATE_LEAD, ADJUDICATE_PLIES, material_white,
 # v0.2 defaults (AlphaZero used 800; laptop budget stays far below that).
 DEFAULT_RES_BLOCKS = 8
 DEFAULT_SIMULATIONS = 80
+# v0.3 playout cap (KataGo §3.1): most turns are cheap; only full turns train π.
+FAST_SIMULATIONS = 16
+FULL_SEARCH_P = 0.25
+LATE_WEIGHT_FLOOR = 0.2
 
 class SelfPlayWorker:
     def __init__(self, model_path=None, num_simulations=DEFAULT_SIMULATIONS, num_res_blocks=DEFAULT_RES_BLOCKS):
@@ -28,15 +32,17 @@ class SelfPlayWorker:
         self.action_encoder = ActionEncoder()
 
     def play_game(self, render=False, delay=0.5, live=None, hold=0.0, sampling_moves=30):
-        """Plays a single game of AlphaZero vs AlphaZero and returns the training examples.
+        """Plays a single game of Zero vs Zero and returns the training examples.
 
-        Self-play follows the AlphaZero pseudocode: Dirichlet noise at the root, and for the
-        first `sampling_moves` plies the move is sampled from the visit counts. After that
-        it plays the most visited move. The saved policy target is still the visit counts.
+        v0.3 playout cap: a fraction FULL_SEARCH_P of turns run a full noisy
+        search (N sims, forced playouts, pruned π recorded). The rest run a
+        fast quiet search (n sims, no noise) just to move the game forward.
         """
         board = chess.Board()
-        examples = [] # Will store temporary tuples of (board_tensor, pi_tensor, player_turn)
+        examples = []  # (board_tensor, pi, player_turn, ply, v_prior, q_root)
         last_move = None
+        full_turns = 0
+        fast_turns = 0
 
         if not render:
             print("Starting new self-play game...")
@@ -47,26 +53,47 @@ class SelfPlayWorker:
         while board.outcome(claim_draw=True) is None:
             if render:
                 os.system('cls' if os.name == 'nt' else 'clear')
-                print(f"--- Tabula AI Self-Play (Move {moves}) ---")
+                print(f"--- Zero Self-Play (Move {moves}) ---")
                 print(board.unicode())
                 time.sleep(delay)
 
-            # 1. Run MCTS. Noise is on so this game is not a copy of the last one.
-            root_node = self.mcts.search(board, encode_board, add_noise=True)
+            is_full = np.random.random() < FULL_SEARCH_P
+            if is_full:
+                _, v_prior = self.mcts.predict(board, encode_board)
+                root_node = self.mcts.search(
+                    board,
+                    encode_board,
+                    add_noise=True,
+                    num_simulations=self.mcts.num_simulations,
+                    force_playouts=True,
+                )
+                policy = self.mcts.pruned_policy_target(root_node)
+                full_turns += 1
+            else:
+                v_prior = None
+                root_node = self.mcts.search(
+                    board,
+                    encode_board,
+                    add_noise=False,
+                    num_simulations=FAST_SIMULATIONS,
+                    force_playouts=False,
+                )
+                policy = None
+                fast_turns += 1
 
-            # 2. Policy target π is the visit distribution. Temperature only picks the move.
-            pi = np.zeros(4672, dtype=np.float32)
             total_visits = sum(child.visit_count for child in root_node.children.values())
             if total_visits <= 0:
                 break
 
             # Policy targets live in side-to-move coordinates (same as encode_board).
             flip = needs_orient(board)
-            for move, child in root_node.children.items():
-                idx = self.action_encoder.encode(orient_move(move, flip))
-                pi[idx] = child.visit_count / total_visits
+            pi = np.zeros(4672, dtype=np.float32)
+            if policy:
+                for move, prob in policy.items():
+                    idx = self.action_encoder.encode(orient_move(move, flip))
+                    pi[idx] = prob
 
-            selection = "sample" if moves < sampling_moves else "greedy"
+            selection = "sample" if (is_full and moves < sampling_moves) else "greedy"
             played = _choose_move(root_node, selection)
 
             if live is not None:
@@ -82,9 +109,10 @@ class SelfPlayWorker:
                 if hold:
                     time.sleep(hold)
 
-            # 3. Store the State (s), Policy (π), and whose turn it is
-            state_tensor = encode_board(board)
-            examples.append([state_tensor, pi, board.turn])
+            # 3. Only full-search turns enter the training buffer.
+            if is_full and policy:
+                state_tensor = encode_board(board)
+                examples.append([state_tensor, pi, board.turn, moves, float(v_prior), float(root_node.q_value)])
 
             # 4. Push the move to the board
             board.push(played)
@@ -123,7 +151,11 @@ class SelfPlayWorker:
             print(board.unicode())
             time.sleep(2.0)
 
-        print(f"Game over after {moves} plies. {result} ({termination}). Reward for White: {reward}")
+        print(
+            f"Game over after {moves} plies. {result} ({termination}). "
+            f"Reward for White: {reward} | recorded {len(examples)}/{moves} "
+            f"(full={full_turns} fast={fast_turns})"
+        )
         if live is not None:
             winner = "WHITE" if reward > 0.05 else ("BLACK" if reward < -0.05 else "DRAW")
             live.record_game_outcome("self-play", winner, termination, moves)
@@ -141,12 +173,20 @@ class SelfPlayWorker:
             if hold:
                 time.sleep(max(hold, 1.0))
         
-        # 6. Retroactively assign the final reward to all saved turns
+        # 6. Assign z and a LATE × surprise sample weight to each full-search turn.
         training_data = []
-        for state_tensor, pi, player_turn in examples:
-            # If it was White's turn, the reward is `reward`. If Black's turn, it's `-reward`.
+        total_plies = max(moves, 1)
+        for state_tensor, pi, player_turn, ply, v_prior, q_root in examples:
             actual_reward = reward if player_turn == chess.WHITE else -reward
-            training_data.append((state_tensor, pi, np.array([actual_reward], dtype=np.float32)))
+            late = LATE_WEIGHT_FLOOR + (1.0 - LATE_WEIGHT_FLOOR) * (ply / total_plies)
+            surprise = 1.0 + abs(v_prior - q_root)
+            weight = float(late * surprise)
+            training_data.append((
+                state_tensor,
+                pi,
+                np.array([actual_reward], dtype=np.float32),
+                np.array([weight], dtype=np.float32),
+            ))
             
         return training_data
 
@@ -160,8 +200,9 @@ def _choose_move(root, selection):
     return moves[int(np.random.choice(len(moves), p=weights))]
 
 def main():
-    # We use fewer simulations for this test script so it runs fast in the terminal
-    worker = SelfPlayWorker(num_simulations=DEFAULT_SIMULATIONS)
+    champ = "models/tabula_v0.2_champion.pth"
+    model_path = champ if os.path.exists(champ) else None
+    worker = SelfPlayWorker(model_path=model_path, num_simulations=DEFAULT_SIMULATIONS)
     
     print("--- GENERATING 1 TEST GAME ---")
     start_time = time.time()

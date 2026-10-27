@@ -13,33 +13,46 @@ import numpy as np
 # v0.2 capacity + schedule (v0.1 was 5 blocks / flat Adam).
 DEFAULT_RES_BLOCKS = 8
 MODEL_LATEST = "tabula_v0.2_latest.pth"
+# v0.3: keep the replay window tight so Gen-1 noise is forgotten faster.
+DEFAULT_MAX_FILES = 10
 
 
 class SelfPlayDataset(Dataset):
-    def __init__(self, data_dir, max_files=25):
+    def __init__(self, data_dir, max_files=DEFAULT_MAX_FILES):
         """
         Loads the most recent self-play .pt files (sliding replay buffer).
         Pre-vectorizes data into contiguous tensors to eliminate Python per-item overhead.
+
+        Each item may be (s, π, z) from v0.2 or (s, π, z, w) from v0.3.
+        Missing weights default to 1.0.
         """
         pt_files = sorted(glob.glob(os.path.join(data_dir, "*.pt")), key=os.path.getmtime)
         selected_files = pt_files[-max_files:] if len(pt_files) > max_files else pt_files
         
-        all_states, all_pis, all_zs = [], [], []
+        all_states, all_pis, all_zs, all_ws = [], [], [], []
         for f in selected_files:
             data = torch.load(f, weights_only=False)
-            for s, pi, z in data:
+            for item in data:
+                if len(item) == 4:
+                    s, pi, z, w = item
+                else:
+                    s, pi, z = item
+                    w = np.array([1.0], dtype=np.float32)
                 all_states.append(s)
                 all_pis.append(pi)
                 all_zs.append(z)
+                all_ws.append(w)
                 
         if all_states:
             self.states = torch.from_numpy(np.array(all_states, dtype=np.float32))
             self.pis = torch.from_numpy(np.array(all_pis, dtype=np.float32))
             self.zs = torch.from_numpy(np.array(all_zs, dtype=np.float32))
+            self.weights = torch.from_numpy(np.array(all_ws, dtype=np.float32)).reshape(-1)
         else:
             self.states = torch.empty((0, 13, 8, 8), dtype=torch.float32)
             self.pis = torch.empty((0, 4672), dtype=torch.float32)
             self.zs = torch.empty((0, 1), dtype=torch.float32)
+            self.weights = torch.empty((0,), dtype=torch.float32)
             
         print(f"Loaded {len(self.states)} examples from {len(selected_files)} recent files (Replay buffer window).")
 
@@ -47,11 +60,11 @@ class SelfPlayDataset(Dataset):
         return len(self.states)
 
     def __getitem__(self, idx):
-        return self.states[idx], self.pis[idx], self.zs[idx]
+        return self.states[idx], self.pis[idx], self.zs[idx], self.weights[idx]
 
 
 def train(live=None):
-    print("=== Zero - AlphaZero Training Loop (v0.2) ===")
+    print("=== Zero - AlphaZero Training Loop (v0.3) ===")
     
     # --- Configuration ---
     data_dir = "data"
@@ -63,14 +76,14 @@ def train(live=None):
     num_res_blocks = DEFAULT_RES_BLOCKS
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device} | ResBlocks={num_res_blocks} | cosine LR")
+    print(f"Using device: {device} | ResBlocks={num_res_blocks} | cosine LR | weighted LATE/surprise")
     
     os.makedirs(models_dir, exist_ok=True)
     model_path = os.path.join(models_dir, MODEL_LATEST)
     
     # 1. Load Data
     print("\n--- 1. Loading Self-Play Data ---")
-    dataset = SelfPlayDataset(data_dir, max_files=25)
+    dataset = SelfPlayDataset(data_dir, max_files=DEFAULT_MAX_FILES)
     if len(dataset) == 0:
         print("No training data found. Run self-play first (python -m tabula.selfplay.worker).")
         return
@@ -97,11 +110,9 @@ def train(live=None):
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.05)
     
-    # AlphaZero Joint Loss Function:
-    # 1. Policy Loss: Cross Entropy between target probabilities (pi) and predicted logits (p).
-    # 2. Value Loss: Mean Squared Error between actual game outcome (z) and predicted value (v).
-    policy_loss_fn = nn.CrossEntropyLoss()
-    value_loss_fn = nn.MSELoss()
+    # Per-sample losses so LATE / surprise weights can scale each row.
+    policy_loss_fn = nn.CrossEntropyLoss(reduction="none")
+    value_loss_fn = nn.MSELoss(reduction="none")
     
     # 4. Training Loop
     print("\n--- 3. Starting Training Loop ---")
@@ -114,20 +125,22 @@ def train(live=None):
         
         start_time = time.time()
         
-        for batch_idx, (states, pis, zs) in enumerate(dataloader):
+        for batch_idx, (states, pis, zs, weights) in enumerate(dataloader):
             # Move data to GPU asynchronously
             states = states.to(device, non_blocking=True)
             pis = pis.to(device, non_blocking=True)
             zs = zs.to(device, non_blocking=True)
+            weights = weights.to(device, non_blocking=True)
             
             optimizer.zero_grad()
             
             # Forward pass
             policy_logits, values = model(states)
             
-            # Compute losses
-            loss_p = policy_loss_fn(policy_logits, pis)
-            loss_v = value_loss_fn(values, zs)
+            loss_p_row = policy_loss_fn(policy_logits, pis)
+            loss_v_row = value_loss_fn(values, zs).view(-1)
+            loss_p = (loss_p_row * weights).mean()
+            loss_v = (loss_v_row * weights).mean()
             
             # Combine into joint loss
             total_loss = loss_p + loss_v

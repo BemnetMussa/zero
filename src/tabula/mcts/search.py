@@ -3,18 +3,33 @@ import numpy as np
 import torch
 import chess
 
+from tabula.game.score import is_repetition_draw, repetition_draw_reward
+
+FORCED_PLAYOUT_K = 2.0
+
+
 def terminal_value(board):
     """Value for the side to move, or None if the game is still going.
 
-    A draw the rules will claim (repetition, the 50-move rule) is 0.
+    A draw the rules will claim (repetition, the 50-move rule) is 0,
+    except a repetition while one side is ahead: that side is penalized
+    (v0.3 comfort-draw contempt) so search will not hide in a threefold.
     Checkmate is -1 for the side that has to move.
     """
     outcome = board.outcome(claim_draw=True)
     if outcome is None:
         return None
     if outcome.winner is None:
+        if is_repetition_draw(outcome):
+            white_reward = repetition_draw_reward(board)
+            return white_reward if board.turn == chess.WHITE else -white_reward
         return 0.0
     return 1.0 if outcome.winner == board.turn else -1.0
+
+
+def forced_visit_floor(prior_prob, parent_visits, k=FORCED_PLAYOUT_K) -> float:
+    """KataGo n_forced(c) = sqrt(k * P(c) * sum N(c'))."""
+    return math.sqrt(k * max(float(prior_prob), 1e-12) * max(float(parent_visits), 1.0))
 
 
 class Node:
@@ -58,7 +73,16 @@ class MCTS:
         self.num_simulations = num_simulations
         self.c_puct = c_puct  # Hyperparameter controlling exploration
 
-    def search(self, board, encoder, add_noise=False, dirichlet_alpha=0.3, noise_fraction=0.25):
+    def search(
+        self,
+        board,
+        encoder,
+        add_noise=False,
+        dirichlet_alpha=0.3,
+        noise_fraction=0.25,
+        num_simulations=None,
+        force_playouts=False,
+    ):
         """
         Run the simulations to build the tree and return the root node.
         We can then pick the best move based on the visit counts of the root's children.
@@ -66,7 +90,13 @@ class MCTS:
         add_noise is for self-play only. AlphaZero mixes Dirichlet noise into the
         root prior so the search sometimes tries moves the network currently ignores.
         Arena games and human play leave it off.
+
+        num_simulations overrides the constructor default (v0.3 playout cap:
+        full turns pass 80, fast turns pass 16).
+        force_playouts is for full self-play searches: under-visited root
+        children that already have a visit are forced up to n_forced.
         """
+        n_sims = self.num_simulations if num_simulations is None else int(num_simulations)
         root = Node(prior_prob=1.0)
         
         # 0. Initial Expansion
@@ -75,14 +105,15 @@ class MCTS:
         if add_noise and root.children:
             self._add_dirichlet(root, dirichlet_alpha, noise_fraction)
 
-        for _ in range(self.num_simulations):
+        for _ in range(n_sims):
             node = root
             search_board = board.copy()
             
             # 1. SELECT
             # Traverse down the tree picking the highest PUCT score until we hit a leaf
             while node.is_expanded():
-                move, node = self.select_child(node)
+                at_root = node is root
+                move, node = self.select_child(node, force_playouts=force_playouts and at_root)
                 search_board.push(move)
                 
             # 2. EXPAND & EVALUATE
@@ -107,8 +138,27 @@ class MCTS:
         for child, eta in zip(children, noise):
             child.prior_prob = child.prior_prob * (1.0 - fraction) + float(eta) * fraction
 
-    def select_child(self, node: Node):
-        """Pick the child with the highest PUCT score."""
+    def select_child(self, node: Node, force_playouts=False):
+        """Pick the child with the highest PUCT score.
+
+        When force_playouts is on (root of a full self-play search), any
+        already-visited child still below n_forced is selected first so
+        MCTS actually tests the challenging second choice.
+        """
+        if force_playouts and node.children:
+            parent_visits = sum(child.visit_count for child in node.children.values())
+            under = []
+            for action, child in node.children.items():
+                if child.visit_count <= 0:
+                    continue
+                floor = forced_visit_floor(child.prior_prob, parent_visits)
+                if child.visit_count < floor:
+                    under.append((floor - child.visit_count, child.prior_prob, action, child))
+            if under:
+                under.sort(reverse=True)
+                _, _, action, child = under[0]
+                return action, child
+
         best_score = -float('inf')
         best_action = None
         best_child = None
@@ -121,6 +171,45 @@ class MCTS:
                 best_child = child
                 
         return best_action, best_child
+
+    def pruned_visits(self, root: Node, k=FORCED_PLAYOUT_K):
+        """Raw vs pruned visit counts at the root (does not mutate the tree)."""
+        raw = {move: child.visit_count for move, child in root.children.items()}
+        if not raw:
+            return raw, {}
+        parent_visits = sum(raw.values())
+        if parent_visits <= 0:
+            return raw, dict(raw)
+
+        best_move = max(raw, key=raw.get)
+        puct_best = self.puct_score(root, root.children[best_move])
+        pruned = dict(raw)
+        for move, child in root.children.items():
+            if move == best_move:
+                continue
+            if self.puct_score(root, child) >= puct_best:
+                continue
+            floor = forced_visit_floor(child.prior_prob, parent_visits, k=k)
+            leftover = pruned[move] - floor
+            pruned[move] = 0.0 if leftover <= 1.0 else leftover
+        return raw, pruned
+
+    def pruned_policy_target(self, root: Node):
+        """Visit distribution after policy-target pruning (sums to 1).
+
+        Forced visits on a move stay in π only if that move's Value Q made
+        its PUCT competitive with the best move. Bad noise is zeroed so
+        the weights never memorize a blunder.
+        """
+        _, pruned = self.pruned_visits(root)
+        total = sum(pruned.values())
+        if total <= 0:
+            raw = {move: child.visit_count for move, child in root.children.items()}
+            total = sum(raw.values())
+            if total <= 0:
+                return {}
+            return {move: count / total for move, count in raw.items()}
+        return {move: count / total for move, count in pruned.items() if count > 0}
 
     def puct_score(self, parent: Node, child: Node) -> float:
         """

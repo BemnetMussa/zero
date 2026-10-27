@@ -51,7 +51,7 @@ class SelfPlayDataset(Dataset):
 
 
 def train(live=None):
-    print("=== Tabula AI - AlphaZero Training Loop (v0.2) ===")
+    print("=== Zero - AlphaZero Training Loop (v0.2) ===")
     
     # --- Configuration ---
     data_dir = "data"

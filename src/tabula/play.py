@@ -1,4 +1,4 @@
-"""Play White against Tabula v0.2 (PyTorch + MCTS) in the terminal."""
+"""Play White against Zero v0.2 (PyTorch + MCTS) in the terminal."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ WEIGHTS = "models/tabula_v0.2_champion.pth"
 
 
 def main() -> None:
-    print("Loading TabulaNet (v0.2, 8 ResBlocks)...")
+    print("Loading Zero net (v0.2, 8 ResBlocks)...")
     model = TabulaNet(num_res_blocks=DEFAULT_RES_BLOCKS)
     if os.path.exists(WEIGHTS):
         model.load_state_dict(torch.load(WEIGHTS, map_location="cpu", weights_only=True))
@@ -27,7 +27,7 @@ def main() -> None:
     mcts = MCTS(model, num_simulations=80, c_puct=1.25)
 
     game = Game()
-    print("You are White. Tabula v0.2 (MCTS) is Black.")
+    print("You are White. Zero v0.2 (MCTS) is Black.")
     print("Moves: e2e4 or e4. Quit with q.")
     print(game.board)
 
@@ -55,7 +55,7 @@ def main() -> None:
                     best_move = move
 
             played = game.push(best_move.uci())
-            print(f"tabula: {played}")
+            print(f"zero: {played}")
 
         print(game.board)
 

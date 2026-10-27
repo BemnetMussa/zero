@@ -70,7 +70,7 @@ def main():
     iteration = get_next_iteration()
 
     print(
-        f"[Tabula v0.2] {DEFAULT_RES_BLOCKS} ResBlocks | "
+        f"[Zero v0.2] {DEFAULT_RES_BLOCKS} ResBlocks | "
         f"self-play {DEFAULT_SIMULATIONS} sims | arena {ARENA_SIMULATIONS} sims | "
         f"perspective encoding | cosine LR"
     )
@@ -166,5 +166,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         import sys
-        sys.stdout.write("\033[?25h\n\n[Tabula AI] Pipeline paused cleanly by user.\n")
+        sys.stdout.write("\033[?25h\n\n[Zero] Pipeline paused cleanly by user.\n")
         sys.stdout.flush()

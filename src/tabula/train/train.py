@@ -10,6 +10,11 @@ from tabula.model.model import TabulaNet
 
 import numpy as np
 
+# v0.2 capacity + schedule (v0.1 was 5 blocks / flat Adam).
+DEFAULT_RES_BLOCKS = 8
+MODEL_LATEST = "tabula_v0.2_latest.pth"
+
+
 class SelfPlayDataset(Dataset):
     def __init__(self, data_dir, max_files=25):
         """
@@ -44,22 +49,24 @@ class SelfPlayDataset(Dataset):
     def __getitem__(self, idx):
         return self.states[idx], self.pis[idx], self.zs[idx]
 
+
 def train(live=None):
-    print("=== Tabula AI - AlphaZero Training Loop ===")
+    print("=== Tabula AI - AlphaZero Training Loop (v0.2) ===")
     
     # --- Configuration ---
     data_dir = "data"
     models_dir = "models"
-    batch_size = 64  # Small batch to respect 4GB VRAM
+    batch_size = 48  # Slightly under v1's 64 to leave headroom for 8 ResBlocks on 4GB
     epochs = 10
     lr = 0.001
     weight_decay = 1e-4  # L2 regularization (c ||theta||^2)
+    num_res_blocks = DEFAULT_RES_BLOCKS
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Using device: {device} | ResBlocks={num_res_blocks} | cosine LR")
     
     os.makedirs(models_dir, exist_ok=True)
-    model_path = os.path.join(models_dir, "tabula_v1_latest.pth")
+    model_path = os.path.join(models_dir, MODEL_LATEST)
     
     # 1. Load Data
     print("\n--- 1. Loading Self-Play Data ---")
@@ -78,16 +85,17 @@ def train(live=None):
     
     # 2. Initialize Model
     print("\n--- 2. Initializing Neural Network ---")
-    model = TabulaNet(num_res_blocks=5).to(device)
+    model = TabulaNet(num_res_blocks=num_res_blocks).to(device)
     
     if os.path.exists(model_path):
         print(f"Found existing weights. Loading from {model_path}...")
         model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     else:
-        print("Starting with fresh randomly initialized weights.")
+        print("Starting with fresh randomly initialized weights (v0.2 / perspective / 8 blocks).")
     
-    # 3. Optimizer & Loss Functions
+    # 3. Optimizer, cosine schedule, loss
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.05)
     
     # AlphaZero Joint Loss Function:
     # 1. Policy Loss: Cross Entropy between target probabilities (pi) and predicted logits (p).
@@ -131,14 +139,20 @@ def train(live=None):
             epoch_policy_loss += loss_p.item()
             epoch_value_loss += loss_v.item()
             epoch_total_loss += total_loss.item()
-            
+
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+        
         # Calculate averages for logging
         avg_p_loss = epoch_policy_loss / len(dataloader)
         avg_v_loss = epoch_value_loss / len(dataloader)
         avg_total_loss = epoch_total_loss / len(dataloader)
         
         elapsed = time.time() - start_time
-        print(f"Epoch {epoch+1:02d}/{epochs} [{elapsed:.1f}s] - Total Loss: {avg_total_loss:.4f} (Policy: {avg_p_loss:.4f}, Value: {avg_v_loss:.4f})")
+        print(
+            f"Epoch {epoch+1:02d}/{epochs} [{elapsed:.1f}s] lr={current_lr:.6f} - "
+            f"Total Loss: {avg_total_loss:.4f} (Policy: {avg_p_loss:.4f}, Value: {avg_v_loss:.4f})"
+        )
         if live is not None:
             live.show_training(epoch + 1, epochs, avg_total_loss, avg_p_loss, avg_v_loss)
         

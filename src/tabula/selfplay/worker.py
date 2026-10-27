@@ -6,15 +6,19 @@ import chess
 
 from tabula.model.model import TabulaNet
 from tabula.mcts.search import MCTS
-from tabula.game.encoder import encode_board
+from tabula.game.encoder import encode_board, needs_orient, orient_move
 from tabula.game.action_encoder import ActionEncoder
 from tabula.game.score import ADJUDICATE_LEAD, ADJUDICATE_PLIES, material_white, score_game
 
+# v0.2 defaults (AlphaZero used 800; laptop budget stays far below that).
+DEFAULT_RES_BLOCKS = 8
+DEFAULT_SIMULATIONS = 80
+
 class SelfPlayWorker:
-    def __init__(self, model_path=None, num_simulations=40):
+    def __init__(self, model_path=None, num_simulations=DEFAULT_SIMULATIONS, num_res_blocks=DEFAULT_RES_BLOCKS):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Initializing TabulaNet for Self-Play on {self.device}...")
-        self.model = TabulaNet(num_res_blocks=5).to(self.device)
+        print(f"Initializing TabulaNet for Self-Play on {self.device} ({num_res_blocks} ResBlocks, {num_simulations} sims)...")
+        self.model = TabulaNet(num_res_blocks=num_res_blocks).to(self.device)
 
         if model_path and os.path.exists(model_path):
             self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
@@ -56,8 +60,10 @@ class SelfPlayWorker:
             if total_visits <= 0:
                 break
 
+            # Policy targets live in side-to-move coordinates (same as encode_board).
+            flip = needs_orient(board)
             for move, child in root_node.children.items():
-                idx = self.action_encoder.encode(move)
+                idx = self.action_encoder.encode(orient_move(move, flip))
                 pi[idx] = child.visit_count / total_visits
 
             selection = "sample" if moves < sampling_moves else "greedy"
@@ -155,7 +161,7 @@ def _choose_move(root, selection):
 
 def main():
     # We use fewer simulations for this test script so it runs fast in the terminal
-    worker = SelfPlayWorker(num_simulations=40)
+    worker = SelfPlayWorker(num_simulations=DEFAULT_SIMULATIONS)
     
     print("--- GENERATING 1 TEST GAME ---")
     start_time = time.time()

@@ -92,8 +92,8 @@ class TabulaNet(nn.Module):
 
 if __name__ == "__main__":
     # --- QUICK TEST TO VERIFY SHAPES ---
-    print("Initializing TabulaNet (V1)...")
-    model = TabulaNet(num_res_blocks=5)
+    print("Initializing TabulaNet (v0.2 default shape check)...")
+    model = TabulaNet(num_res_blocks=8)
     
     # Create a dummy input tensor matching our 13-layer V1 design
     # Shape: (Batch_Size=1, Channels=13, Height=8, Width=8)

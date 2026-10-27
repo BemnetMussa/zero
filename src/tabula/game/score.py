@@ -43,11 +43,15 @@ def material_value(board) -> float:
     return float(np.tanh(material_white(board) / MATERIAL_SCALE))
 
 
-def score_game(board, outcome, stop):
+def score_game(board, outcome, stop, adjudicate_scale=1.0):
     """Reward from White's point of view, plus a short result label and why it ended.
 
     `stop` is set when the loop ended the game itself ("MATERIAL" or "MOVE_LIMIT").
     A result python-chess already decided wins over that.
+
+    `adjudicate_scale` < 1.0 softens material/move-limit cutoffs so they do not
+    count like full checkmates in the arena gate (v0.2). Mates and rules draws
+    are unchanged.
     """
     if outcome is not None and outcome.winner is not None:
         reward = 1.0 if outcome.winner == chess.WHITE else -1.0
@@ -57,7 +61,7 @@ def score_game(board, outcome, stop):
     if outcome is not None and outcome.winner is None:
         return 0.0, "DRAW", outcome.termination.name
 
-    reward = material_value(board)
+    reward = material_value(board) * float(adjudicate_scale)
     if reward > 0.15:
         result = "WHITE AHEAD"
     elif reward < -0.15:

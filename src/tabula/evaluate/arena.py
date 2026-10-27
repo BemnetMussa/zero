@@ -7,6 +7,10 @@ from tabula.mcts.search import MCTS
 from tabula.game.encoder import encode_board
 from tabula.game.score import ADJUDICATE_LEAD, ADJUDICATE_PLIES, material_white, score_game
 
+# v0.2: material/move-limit cutoffs count less than real mates in the gate.
+ARENA_ADJUDICATE_SCALE = 0.5
+DEFAULT_RES_BLOCKS = 8
+
 # 10 openings × 2 colors = 20 unique paired games (matches pipeline num_games=20).
 # With only 5 openings, games 11–20 were deterministic clones of games 1–10.
 OPENING_SUITE = [
@@ -23,12 +27,12 @@ OPENING_SUITE = [
 ]
 
 class Arena:
-    def __init__(self, champion_path, challenger_path, num_simulations=40):
+    def __init__(self, champion_path, challenger_path, num_simulations=100, num_res_blocks=DEFAULT_RES_BLOCKS):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Arena running on: {self.device}")
+        print(f"Arena running on: {self.device} ({num_res_blocks} ResBlocks, {num_simulations} sims)")
         
         # 1. Load the Champion
-        self.champion = TabulaNet(num_res_blocks=5).to(self.device)
+        self.champion = TabulaNet(num_res_blocks=num_res_blocks).to(self.device)
         if os.path.exists(champion_path):
             self.champion.load_state_dict(torch.load(champion_path, map_location=self.device, weights_only=True))
         else:
@@ -36,7 +40,7 @@ class Arena:
         self.champion.eval()
         
         # 2. Load the Challenger
-        self.challenger = TabulaNet(num_res_blocks=5).to(self.device)
+        self.challenger = TabulaNet(num_res_blocks=num_res_blocks).to(self.device)
         if os.path.exists(challenger_path):
             self.challenger.load_state_dict(torch.load(challenger_path, map_location=self.device, weights_only=True))
         else:
@@ -119,7 +123,9 @@ class Arena:
         # Mate is a full point. A rules draw is half. A game we cut off is scored
         # from the material, so a queen-up challenger is not recorded as a draw.
         outcome = board.outcome(claim_draw=True)
-        white_reward, result, termination = score_game(board, outcome, stop)
+        white_reward, result, termination = score_game(
+            board, outcome, stop, adjudicate_scale=ARENA_ADJUDICATE_SCALE
+        )
         self.last_result = f"{result} ({termination}) white {white_reward:+.2f}"
         if live is not None:
             winner = "WHITE" if white_reward > 0.05 else ("BLACK" if white_reward < -0.05 else "DRAW")
@@ -221,9 +227,9 @@ class Arena:
             return False
 
 if __name__ == "__main__":
-    # Test the Arena
-    champ_file = "models/tabula_v1_champion.pth"
-    chall_file = "models/tabula_v1_latest.pth"
+    # Test the Arena (v0.2 paths)
+    champ_file = "models/tabula_v0.2_champion.pth"
+    chall_file = "models/tabula_v0.2_latest.pth"
     
     # If there's no champion yet, the latest trained network automatically becomes it.
     if not os.path.exists(champ_file) and os.path.exists(chall_file):
@@ -232,6 +238,6 @@ if __name__ == "__main__":
         os.makedirs("models", exist_ok=True)
         shutil.copy(chall_file, champ_file)
         
-    # Manual smoke test — lighter than the pipeline gate (80 sims / 20 games).
+    # Manual smoke test — lighter than the pipeline gate (100 sims / 20 games).
     arena = Arena(champion_path=champ_file, challenger_path=chall_file, num_simulations=40)
     arena.evaluate(num_games=4, win_threshold=0.55)

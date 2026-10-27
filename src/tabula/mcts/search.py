@@ -167,13 +167,17 @@ class MCTS:
         from tabula.game.action_encoder import ActionEncoder
         import torch.nn.functional as F
         
+        from tabula.game.encoder import needs_orient, orient_move
+
         encoder_4672 = ActionEncoder()
         legal_moves = list(board.legal_moves)
         
         if not legal_moves:
             return {}, v
-            
-        legal_indices = [encoder_4672.encode(m) for m in legal_moves]
+
+        # Policy tensor is in side-to-move coordinates; map real moves before indexing.
+        flip = needs_orient(board)
+        legal_indices = [encoder_4672.encode(orient_move(m, flip)) for m in legal_moves]
         
         # Mask out illegal moves by setting their logits to negative infinity
         mask = torch.full((4672,), float('-inf'), device=logits.device)
@@ -182,7 +186,10 @@ class MCTS:
         # Apply Softmax to convert the raw logits into actual probabilities (summing to 1.0)
         probs = F.softmax(mask, dim=0)
         
-        # Map the probabilities back to the legal moves
-        policy_dict = {m: probs[encoder_4672.encode(m)].item() for m in legal_moves}
+        # Map probabilities back onto real-board moves
+        policy_dict = {
+            m: probs[encoder_4672.encode(orient_move(m, flip))].item()
+            for m in legal_moves
+        }
             
         return policy_dict, v

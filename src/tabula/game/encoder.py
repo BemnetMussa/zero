@@ -1,70 +1,83 @@
+"""Board encoding for Tabula — AlphaZero side-to-move perspective.
+
+Channels 0-5 = side-to-move pieces, 6-11 = opponent, 12 = colour of side to move
+(1 = White, 0 = Black). When Black is to move the board is rotated 180° so "we"
+always sit at the bottom and pawns move in the +rank direction in tensor space.
+"""
+
 import numpy as np
 import chess
 
-def encode_board(board):
+# 180° rotation: a1 <-> h8. Used when Black is to move.
+_FLIP = 63
+
+PIECE_TO_PLANE = {
+    chess.PAWN: 0,
+    chess.KNIGHT: 1,
+    chess.BISHOP: 2,
+    chess.ROOK: 3,
+    chess.QUEEN: 4,
+    chess.KING: 5,
+}
+
+
+def needs_orient(board) -> bool:
+    """True when the board must be rotated for the side-to-move view."""
+    return board.turn == chess.BLACK
+
+
+def orient_square(square: int, flip: bool) -> int:
+    return square ^ _FLIP if flip else square
+
+
+def orient_move(move: chess.Move, flip: bool) -> chess.Move:
+    """Map a real-board move into (or out of) the oriented policy tensor space."""
+    if not flip:
+        return move
+    return chess.Move(
+        orient_square(move.from_square, True),
+        orient_square(move.to_square, True),
+        promotion=move.promotion,
+    )
+
+
+def encode_board(board) -> np.ndarray:
     """
-    Converts a python-chess board into a 3D numpy array (13 x 8 x 8).
-    This is the exact style AlphaZero uses to 'see' the board.
-    
-    - Channels 0-5: White pieces (P, N, B, R, Q, K)
-    - Channels 6-11: Black pieces (p, n, b, r, q, k)
-    - Channel 12: Player turn (all 1s if White, all 0s if Black)
+    (13, 8, 8) float32 tensor from the side-to-move's perspective.
+
+    - 0-5: our pieces (P, N, B, R, Q, K)
+    - 6-11: opponent pieces
+    - 12: our colour (1 = White to move, 0 = Black to move)
     """
-    # Initialize an empty 13 x 8 x 8 tensor with zeros
     tensor = np.zeros((13, 8, 8), dtype=np.float32)
+    flip = needs_orient(board)
+    us = board.turn
+    them = not us
 
-    # Mapping pieces to their respective layer numbers
-    piece_to_layer = {
-        chess.PAWN: 0,
-        chess.KNIGHT: 1,
-        chess.BISHOP: 2,
-        chess.ROOK: 3,
-        chess.QUEEN: 4,
-        chess.KING: 5
-    }
-
-    # Loop through all 64 squares on the board
     for square in chess.SQUARES:
         piece = board.piece_at(square)
-        if piece:
-            # Get the row (rank) and column (file) of the piece
-            rank = chess.square_rank(square)
-            file = chess.square_file(square)
+        if not piece:
+            continue
+        oriented = orient_square(square, flip)
+        rank = chess.square_rank(oriented)
+        file = chess.square_file(oriented)
+        plane = PIECE_TO_PLANE[piece.piece_type]
+        if piece.color == them:
+            plane += 6
+        tensor[plane, rank, file] = 1.0
 
-            # Determine the base layer for the piece type
-            layer = piece_to_layer[piece.piece_type]
-
-            # If the piece is black, shift it to layers 6-11
-            if piece.color == chess.BLACK:
-                layer += 6
-
-            # Mark the piece on the board with a 1.0
-            tensor[layer][rank][file] = 1.0
-
-    # Channel 12: Whose turn is it?
-    # We fill the entire 8x8 plane with 1s if it's White's turn
-    if board.turn == chess.WHITE:
+    if us == chess.WHITE:
         tensor[12, :, :] = 1.0
-    # (If black, it remains 0.0 because of the np.zeros initialization)
 
     return tensor
 
+
 if __name__ == "__main__":
-    print("=== TABULA AI: THE EYES (State Encoder) ===\n")
-    
-    # Let's test the encoder on the starting position
     b = chess.Board()
-    encoded = encode_board(b)
-    
-    print(f"Original board:\n{b}\n")
-    print(f"Encoded tensor shape: {encoded.shape} (13 layers, 8 rows, 8 columns)\n")
-    
-    print("Here is Layer 0 (White Pawns ONLY):")
-    # Tensors print upside down compared to chess boards usually, but you'll see the line of 1s!
-    print(encoded[0])
-    
-    print("\nHere is Layer 6 (Black Pawns ONLY):")
-    print(encoded[6])
-    
-    print("\nHere is Layer 12 (Whose turn is it? 1 = White, 0 = Black):")
-    print(encoded[12])
+    enc = encode_board(b)
+    print("shape", enc.shape)
+    print("white to move, our pawns (layer 0) rank 1 sum:", enc[0, 1, :].sum())
+    b.push_san("e4")
+    enc_b = encode_board(b)
+    print("black to move after e4 — our (black) pawns should sit on tensor rank 1")
+    print("layer0 rank1 sum", enc_b[0, 1, :].sum(), "colour plane", enc_b[12].mean())

@@ -7,6 +7,7 @@ import torch
 from tabula.selfplay.worker import SelfPlayWorker, DEFAULT_SIMULATIONS, DEFAULT_RES_BLOCKS, FAST_SIMULATIONS, FULL_SEARCH_P
 from tabula.train.train import train
 from tabula.evaluate.arena import Arena
+from tabula.evaluate.mate_exam import run_mate_exam
 from tabula.watch.live import LiveBoard
 from tabula.hardware.thermal import ThermalGuard
 
@@ -60,9 +61,11 @@ def archive_v01_data_if_needed():
     print(f"[v0.2] Archived {moved} v0.1 self-play files → {V01_DATA_ARCHIVE}/")
 
 
-def main(max_iter=None, num_games=5, arena_games=20, enable_tui=True):
+def main(max_iter=None, num_games=5, arena_games=20, enable_tui=True, mate_exam_every=0):
     champ_path = CHAMP_PATH
     chall_path = CHALL_PATH
+    total_practice = 0
+    total_practice_mates = 0
 
     archive_v01_data_if_needed()
 
@@ -99,6 +102,8 @@ def main(max_iter=None, num_games=5, arena_games=20, enable_tui=True):
         )
         
         all_data = []
+        practice_played = 0
+        practice_mates = 0
         
         for g in range(num_games):
             thermal.check_and_cool()
@@ -110,8 +115,18 @@ def main(max_iter=None, num_games=5, arena_games=20, enable_tui=True):
                 practice=g % 2 == 1,
             )
             all_data.extend(data)
+            if g % 2 == 1:
+                practice_played += 1
+                practice_mates += int(worker.last_termination == "CHECKMATE")
             print(f"Completed game {g+1}/{num_games}")
             thermal.rest(2.0) # 2s breather to dissipate heat between games
+
+        total_practice += practice_played
+        total_practice_mates += practice_mates
+        print(
+            f"[practice] iteration {iteration}: {practice_mates}/{practice_played} mated | "
+            f"run total {total_practice_mates}/{total_practice}"
+        )
                 
         # Save the dataset
         os.makedirs("data", exist_ok=True)
@@ -130,6 +145,10 @@ def main(max_iter=None, num_games=5, arena_games=20, enable_tui=True):
         # Train loads recent .pt files in data/ and saves tabula_v0.2_latest.pth
         train(live=live)
         thermal.rest(3.0) # 3s breather after backpropagation
+
+        if mate_exam_every and (finished + 1) % mate_exam_every == 0:
+            print(f"[mate exam] after iteration {iteration}")
+            run_mate_exam(chall_path, out_path=f"data/mate_exam_iter_{iteration}.json")
         
         # ---------------------------------------------------------
         # PHASE 3: EVALUATE (Arena Gating)
@@ -180,6 +199,7 @@ if __name__ == "__main__":
     parser.add_argument("--games", type=int, default=5, help="self-play games per iteration")
     parser.add_argument("--arena-games", type=int, default=20, help="arena games per iteration")
     parser.add_argument("--no-tui", action="store_true", help="disable the live TUI")
+    parser.add_argument("--mate-exam-every", type=int, default=0, help="run the mate exam every N iterations (0 = off)")
     args = parser.parse_args()
     try:
         main(
@@ -187,6 +207,7 @@ if __name__ == "__main__":
             num_games=args.games,
             arena_games=args.arena_games,
             enable_tui=not args.no_tui,
+            mate_exam_every=args.mate_exam_every,
         )
     except KeyboardInterrupt:
         import sys

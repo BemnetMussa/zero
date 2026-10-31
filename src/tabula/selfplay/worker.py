@@ -155,6 +155,7 @@ class SelfPlayWorker:
         # is the material on the board, or the value head never sees a winner.
         outcome = board.outcome(claim_draw=True)
         reward, result, termination = score_game(board, outcome, stop, practice_side=practice_side)
+        self.last_termination = termination
 
         if render:
             os.system('cls' if os.name == 'nt' else 'clear')

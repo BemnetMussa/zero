@@ -103,7 +103,12 @@ def main(max_iter=None, num_games=5, arena_games=20, enable_tui=True):
         for g in range(num_games):
             thermal.check_and_cool()
             # The first game of each iteration is the one on the board.
-            data = worker.play_game(live=live if g == 0 else None, hold=0.03 if g == 0 else 0.0)
+            # Every other game starts from a practice board (K+Q or K+R vs K).
+            data = worker.play_game(
+                live=live if g == 0 else None,
+                hold=0.03 if g == 0 else 0.0,
+                practice=g % 2 == 1,
+            )
             all_data.extend(data)
             print(f"Completed game {g+1}/{num_games}")
             thermal.rest(2.0) # 2s breather to dissipate heat between games

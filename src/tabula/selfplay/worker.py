@@ -9,6 +9,7 @@ from tabula.mcts.search import MCTS
 from tabula.game.encoder import encode_board, needs_orient, orient_move
 from tabula.game.action_encoder import ActionEncoder
 from tabula.game.score import ADJUDICATE_LEAD, ADJUDICATE_PLIES, material_white, score_game
+from tabula.selfplay.practice import random_practice_board
 
 # v0.2 defaults (AlphaZero used 800; laptop budget stays far below that).
 DEFAULT_RES_BLOCKS = 8
@@ -31,21 +32,31 @@ class SelfPlayWorker:
         self.mcts = MCTS(self.model, num_simulations=num_simulations, c_puct=1.25)
         self.action_encoder = ActionEncoder()
 
-    def play_game(self, render=False, delay=0.5, live=None, hold=0.0, sampling_moves=30):
+    def play_game(self, render=False, delay=0.5, live=None, hold=0.0, sampling_moves=30, practice=False):
         """Plays a single game of Zero vs Zero and returns the training examples.
 
         v0.3 playout cap: a fraction FULL_SEARCH_P of turns run a full noisy
         search (N sims, forced playouts, pruned π recorded). The rest run a
         fast quiet search (n sims, no noise) just to move the game forward.
+
+        practice=True starts from a K+Q or K+R vs K board instead of the normal
+        start. The material stop is off there: the extra piece is the whole
+        point, so only mate counts as finishing.
         """
-        board = chess.Board()
+        if practice:
+            board, practice_side = random_practice_board()
+        else:
+            board, practice_side = chess.Board(), None
         examples = []  # (board_tensor, pi, player_turn, ply, v_prior, q_root)
         last_move = None
         full_turns = 0
         fast_turns = 0
 
         if not render:
-            print("Starting new self-play game...")
+            if practice:
+                print(f"Starting practice game from {board.fen()}")
+            else:
+                print("Starting new self-play game...")
 
         moves = 0
         stop = None
@@ -124,7 +135,7 @@ class SelfPlayWorker:
 
             # A held material lead is a decided game for a net that cannot find mate yet.
             # Scoring that 0 is what glued the value head to "everything is a draw".
-            if abs(material_white(board)) >= ADJUDICATE_LEAD:
+            if practice_side is None and abs(material_white(board)) >= ADJUDICATE_LEAD:
                 lead_run += 1
             else:
                 lead_run = 0
@@ -143,7 +154,7 @@ class SelfPlayWorker:
         # Mate stays ±1. A draw the rules produced stays 0. Anything we cut off
         # is the material on the board, or the value head never sees a winner.
         outcome = board.outcome(claim_draw=True)
-        reward, result, termination = score_game(board, outcome, stop)
+        reward, result, termination = score_game(board, outcome, stop, practice_side=practice_side)
 
         if render:
             os.system('cls' if os.name == 'nt' else 'clear')
@@ -151,8 +162,9 @@ class SelfPlayWorker:
             print(board.unicode())
             time.sleep(2.0)
 
+        kind = "Practice game" if practice_side is not None else "Game"
         print(
-            f"Game over after {moves} plies. {result} ({termination}). "
+            f"{kind} over after {moves} plies. {result} ({termination}). "
             f"Reward for White: {reward} | recorded {len(examples)}/{moves} "
             f"(full={full_turns} fast={fast_turns})"
         )

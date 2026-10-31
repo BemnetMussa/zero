@@ -65,7 +65,7 @@ def repetition_draw_reward(board) -> float:
     return -REPETITION_CONTEMPT if lead > 0 else REPETITION_CONTEMPT
 
 
-def score_game(board, outcome, stop, adjudicate_scale=1.0):
+def score_game(board, outcome, stop, adjudicate_scale=1.0, practice_side=None):
     """Reward from White's point of view, plus a short result label and why it ended.
 
     `stop` is set when the loop ended the game itself ("MATERIAL" or "MOVE_LIMIT").
@@ -74,11 +74,20 @@ def score_game(board, outcome, stop, adjudicate_scale=1.0):
     `adjudicate_scale` < 1.0 softens material/move-limit cutoffs so they do not
     count like full checkmates in the arena gate (v0.2). Mates and rules draws
     are unchanged.
+
+    `practice_side` is the side that started a practice board with the extra
+    piece. Anything but mate there (repeat, 50-move rule, stalemate, losing the
+    piece, the move cap) is that side failing to finish, not a fair draw.
     """
     if outcome is not None and outcome.winner is not None:
         reward = 1.0 if outcome.winner == chess.WHITE else -1.0
         result = "WHITE WINS" if reward > 0 else "BLACK WINS"
         return reward, result, outcome.termination.name
+
+    if practice_side is not None:
+        reward = -REPETITION_CONTEMPT if practice_side == chess.WHITE else REPETITION_CONTEMPT
+        termination = outcome.termination.name if outcome is not None else (stop or "UNFINISHED")
+        return reward, "NO MATE", termination
 
     if outcome is not None and outcome.winner is None:
         if is_repetition_draw(outcome):

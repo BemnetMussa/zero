@@ -1,12 +1,15 @@
 import os
 import glob
 import time
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
 from tabula.model.model import TabulaNet
+from tabula.runtime import atomic_torch_save
 
 import numpy as np
 
@@ -15,6 +18,10 @@ DEFAULT_RES_BLOCKS = 8
 MODEL_LATEST = "tabula_v0.2_latest.pth"
 # v0.3: keep the replay window tight so Gen-1 noise is forgotten faster.
 DEFAULT_MAX_FILES = 10
+DEFAULT_BATCH_SIZE = 48
+DEFAULT_EPOCHS = 10
+DEFAULT_LR = 0.001
+DEFAULT_WEIGHT_DECAY = 1e-4
 
 
 class SelfPlayDataset(Dataset):
@@ -63,30 +70,44 @@ class SelfPlayDataset(Dataset):
         return self.states[idx], self.pis[idx], self.zs[idx], self.weights[idx]
 
 
-def train(live=None):
+@dataclass
+class TrainResult:
+    model: TabulaNet
+    optimizer: optim.Optimizer
+    scheduler: optim.lr_scheduler.LRScheduler
+    policy_loss: float
+    value_loss: float
+    total_loss: float
+    learning_rate: float
+    examples: int
+
+
+def train(
+    live=None,
+    *,
+    data_dir="data",
+    model_path=None,
+    checkpoint=None,
+    batch_size=DEFAULT_BATCH_SIZE,
+    epochs=DEFAULT_EPOCHS,
+    device=None,
+):
+    """Train one iteration and return all state needed for an atomic checkpoint."""
     print("=== Zero - AlphaZero Training Loop (v0.3) ===")
     
     # --- Configuration ---
-    data_dir = "data"
-    models_dir = "models"
-    batch_size = 48  # Slightly under v1's 64 to leave headroom for 8 ResBlocks on 4GB
-    epochs = 10
-    lr = 0.001
-    weight_decay = 1e-4  # L2 regularization (c ||theta||^2)
+    lr = DEFAULT_LR
+    weight_decay = DEFAULT_WEIGHT_DECAY
     num_res_blocks = DEFAULT_RES_BLOCKS
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device} | ResBlocks={num_res_blocks} | cosine LR | weighted LATE/surprise")
-    
-    os.makedirs(models_dir, exist_ok=True)
-    model_path = os.path.join(models_dir, MODEL_LATEST)
     
     # 1. Load Data
     print("\n--- 1. Loading Self-Play Data ---")
     dataset = SelfPlayDataset(data_dir, max_files=DEFAULT_MAX_FILES)
     if len(dataset) == 0:
-        print("No training data found. Run self-play first (python -m tabula.selfplay.worker).")
-        return
+        raise RuntimeError("No training data found; refusing to checkpoint an untrained iteration")
         
     dataloader = DataLoader(
         dataset, 
@@ -99,17 +120,27 @@ def train(live=None):
     # 2. Initialize Model
     print("\n--- 2. Initializing Neural Network ---")
     model = TabulaNet(num_res_blocks=num_res_blocks).to(device)
-    
-    if os.path.exists(model_path):
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # One cosine cycle per pipeline iteration, while retaining optimizer and
+    # scheduler continuity across process restarts.
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=epochs,
+        eta_min=lr * 0.05,
+    )
+
+    if checkpoint is not None:
+        print(f"Restoring iteration {checkpoint['iteration']} training state...")
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+    elif model_path and os.path.exists(model_path):
         print(f"Found existing weights. Loading from {model_path}...")
         model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     else:
         print("Starting with fresh randomly initialized weights (v0.2 / perspective / 8 blocks).")
     
-    # 3. Optimizer, cosine schedule, loss
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.05)
-    
+    # 3. Loss functions
     # Per-sample losses so LATE / surprise weights can scale each row.
     policy_loss_fn = nn.CrossEntropyLoss(reduction="none")
     value_loss_fn = nn.MSELoss(reduction="none")
@@ -118,6 +149,9 @@ def train(live=None):
     print("\n--- 3. Starting Training Loop ---")
     model.train()
     
+    avg_p_loss = 0.0
+    avg_v_loss = 0.0
+    avg_total_loss = 0.0
     for epoch in range(epochs):
         epoch_policy_loss = 0.0
         epoch_value_loss = 0.0
@@ -168,11 +202,19 @@ def train(live=None):
         )
         if live is not None:
             live.show_training(epoch + 1, epochs, avg_total_loss, avg_p_loss, avg_v_loss)
-        
-    # 5. Save the trained model
-    print("\n--- 4. Saving Model ---")
-    torch.save(model.state_dict(), model_path)
-    print(f"Training complete. Weights safely stored to {model_path}.")
+
+    return TrainResult(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        policy_loss=avg_p_loss,
+        value_loss=avg_v_loss,
+        total_loss=avg_total_loss,
+        learning_rate=current_lr,
+        examples=len(dataset),
+    )
 
 if __name__ == "__main__":
-    train()
+    result = train(model_path=os.path.join("models", MODEL_LATEST))
+    atomic_torch_save(result.model.state_dict(), os.path.join("models", MODEL_LATEST))
+    print(f"Training complete. Weights safely stored to models/{MODEL_LATEST}.")

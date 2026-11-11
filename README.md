@@ -56,8 +56,16 @@ You are White. Type `e2e4` or `e4`. Quit with `q`.
 ## Train it
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m tabula.pipeline --no-tui
+export SYZYGY_PATH=/home/voare/Documents/AI/tabula/syzygy/345
+PYTHONPATH=src .venv/bin/python -m tabula.pipeline \
+  --no-tui \
+  --output-dir ./checkpoints \
+  --time-limit-hours 7.5
 ```
+
+`SYZYGY_PATH` is mandatory. Startup opens the tables and probes known KQK and
+KRK positions before creating a worker; a missing or broken mount stops the run
+immediately.
 
 Point the same code at the machine's Syzygy 3–5 piece tables:
 
@@ -69,19 +77,44 @@ export SYZYGY_PATH=/home/voare/Documents/AI/tabula/syzygy/345
 export SYZYGY_PATH=/kaggle/input/<dataset-name>/345
 ```
 
-If `SYZYGY_PATH` is unset, Zero checks `syzygy/345` and then
-`/kaggle/input/syzygy-345`.
+For an overnight Kaggle session:
+
+```bash
+export SYZYGY_PATH=/kaggle/input/<dataset-name>/345
+bash scripts/kaggle_overnight.sh
+```
+
+The launcher defaults to 7.5 hours and `/kaggle/working/checkpoints`. Override
+those with `ZERO_TIME_LIMIT_HOURS` and `ZERO_OUTPUT_DIR`. Re-running the same
+command resumes from the newest complete versioned checkpoint.
 
 Useful flags:
 
 | Flag | Meaning |
 | --- | --- |
-| `--max-iter 200` | Stop after this many loops |
+| `--iterations 200` | Run at most this many loops |
 | `--games 5` | Self-play games per loop (every other one starts from a practice board) |
 | `--arena-games 0` | Skip the match (faster cook) |
 | `--mate-exam-every 50` | Re-test K+Q / K+R vs K every 50 loops |
+| `--output-dir PATH` | Store checkpoints, replay, and metrics under this directory |
+| `--time-limit-hours 7.5` | Stop cleanly before the next iteration would exceed the budget |
 
 A thermal guard pauses the laptop if the GPU gets too hot.
+
+Each completed iteration atomically writes:
+
+```text
+checkpoints/
+  weights_iter_0001.pt
+  latest_weights.pt
+  champion_weights.pt
+  metrics.jsonl
+  replay/replay_iter_0001.pt
+```
+
+The versioned checkpoint contains the model, optimizer, scheduler, iteration,
+and metadata. A timeout or failed iteration leaves the previous complete
+checkpoint untouched.
 
 ## Measure it
 

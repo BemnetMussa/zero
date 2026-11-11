@@ -1,216 +1,460 @@
+"""Durable self-play and training pipeline for Tabula Zero."""
+
+from __future__ import annotations
+
 import argparse
+import logging
+import math
 import os
-import shutil
+import sys
 import time
+import traceback
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
 import torch
 
-from tabula.selfplay.worker import SelfPlayWorker, DEFAULT_SIMULATIONS, DEFAULT_RES_BLOCKS, FAST_SIMULATIONS, FULL_SEARCH_P
-from tabula.train.train import train
 from tabula.evaluate.arena import Arena
 from tabula.evaluate.mate_exam import run_mate_exam
-from tabula.watch.live import LiveBoard
+from tabula.runtime import (
+    RunPaths,
+    WallClockBudget,
+    atomic_jsonl_append,
+    atomic_torch_save,
+    checkpoint_payload,
+    latest_checkpoint,
+    load_checkpoint,
+    peak_cuda_memory_mib,
+    require_syzygy,
+    utc_now,
+)
 from tabula.hardware.thermal import ThermalGuard
+from tabula.selfplay.worker import DEFAULT_RES_BLOCKS, DEFAULT_SIMULATIONS, SelfPlayWorker
+from tabula.train.train import DEFAULT_EPOCHS, TrainResult, train
+from tabula.watch.live import LiveBoard
 
-# v0.2: new encoding + 8-block net — do not mix with v0.1 absolute-channel data/weights.
-CHAMP_PATH = "models/tabula_v0.2_champion.pth"
-CHALL_PATH = "models/tabula_v0.2_latest.pth"
-V01_DATA_ARCHIVE = "data/archive_v1_absolute"
-ARENA_SIMULATIONS = 100  # Exam at least as deep as self-play (80); slight edge for the gate.
-
-
-def get_next_iteration() -> int:
-    """Auto-detect next iteration number from existing files in data/ (not archives)."""
-    existing = []
-    if os.path.exists("data"):
-        for f in os.listdir("data"):
-            if f.startswith("selfplay_iter_") and f.endswith(".pt"):
-                try:
-                    parts = f.split("_")
-                    existing.append(int(parts[2]))
-                except (IndexError, ValueError):
-                    pass
-    return (max(existing) + 1) if existing else 1
+LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LEGACY_LATEST = PROJECT_ROOT / "models" / "tabula_v0.2_latest.pth"
+LEGACY_CHAMPION = PROJECT_ROOT / "models" / "tabula_v0.2_champion.pth"
 
 
-def archive_v01_data_if_needed():
-    """Move pre-perspective .pt files out of the active replay window once.
+@dataclass
+class SelfPlayStats:
+    """Counters from one iteration's self-play phase."""
 
-    v0.1 boards used absolute White/Black channels. Training v0.2 on that mix would
-    poison the new side-to-move encoder. Safe to re-run: only moves top-level *.pt
-    when no v0.2 session has started yet (empty check: skip if champion already exists).
-    """
-    if os.path.exists(CHAMP_PATH) or os.path.exists(CHALL_PATH):
-        return  # v0.2 already has weights; active data/ is the new stream
-    if not os.path.exists("data"):
-        return
-    leftovers = [
-        f for f in os.listdir("data")
-        if f.endswith(".pt") and os.path.isfile(os.path.join("data", f))
-    ]
-    if not leftovers:
-        return
-    os.makedirs(V01_DATA_ARCHIVE, exist_ok=True)
-    moved = 0
-    for name in leftovers:
-        src = os.path.join("data", name)
-        dst = os.path.join(V01_DATA_ARCHIVE, name)
-        if os.path.exists(dst):
-            dst = os.path.join(V01_DATA_ARCHIVE, f"{int(time.time())}_{name}")
-        shutil.move(src, dst)
-        moved += 1
-    print(f"[v0.2] Archived {moved} v0.1 self-play files → {V01_DATA_ARCHIVE}/")
+    games_requested: int
+    games_attempted: int = 0
+    games_completed: int = 0
+    game_errors: int = 0
+    full_board_games: int = 0
+    cap_terminations: int = 0
+    practice_games: int = 0
+    practice_mates: int = 0
+    stalled_rollouts_dropped: int = 0
+    replay_examples: int = 0
+
+    @property
+    def cap_termination_rate(self) -> float:
+        if self.full_board_games == 0:
+            return 0.0
+        return self.cap_terminations / self.full_board_games
 
 
-def main(max_iter=None, num_games=5, arena_games=20, enable_tui=True, mate_exam_every=0):
-    champ_path = CHAMP_PATH
-    chall_path = CHALL_PATH
-    total_practice = 0
-    total_practice_mates = 0
+def _log_record(path: Path, event: str, **fields: Any) -> None:
+    atomic_jsonl_append(path, {"event": event, "timestamp": utc_now(), **fields})
 
-    archive_v01_data_if_needed()
 
-    live = LiveBoard(enable_tui=enable_tui)
-    thermal = ThermalGuard(warm_threshold=72.0, emergency_threshold=80.0, target_cool_temp=62.0, cooldown_sleep_sec=2.0)
-    iteration = get_next_iteration()
-    start_iteration = iteration
-    finished = 0
+def _allowed_game_errors(games_requested: int, maximum_rate: float) -> int:
+    """Allow the configured fraction, with one transient failure as a floor."""
 
-    print(
-        f"[Zero v0.3] {DEFAULT_RES_BLOCKS} ResBlocks | "
-        f"self-play {DEFAULT_SIMULATIONS}/{FAST_SIMULATIONS} sims (p={FULL_SEARCH_P}) | "
-        f"arena {ARENA_SIMULATIONS} sims | playout cap + prune + LATE"
-    )
+    return max(1, math.floor(games_requested * maximum_rate))
 
-    # We loop forever (or until max_iter), generating data, training, and evaluating
-    while True:
-        # Pre-check thermals
-        thermal.check_and_cool()
-        
-        # ---------------------------------------------------------
-        # PHASE 1: SELF PLAY (Generate Data)
-        # ---------------------------------------------------------
-        print(f"\n[PHASE 1] Generating Self-Play Data (Iteration {iteration})...")
-        # AlphaZero continuous latest: rejected nets still generate data; the gate
-        # only protects the champion crown (research-corrected vs AGZ champion-only).
-        latest_exists = os.path.exists(chall_path)
-        play_path = chall_path if latest_exists else champ_path
-        live.begin_round(iteration, latest_exists)
-        worker = SelfPlayWorker(
-            model_path=play_path,
-            num_simulations=DEFAULT_SIMULATIONS,
-            num_res_blocks=DEFAULT_RES_BLOCKS,
-        )
-        
-        all_data = []
-        practice_played = 0
-        practice_mates = 0
-        
-        for g in range(num_games):
-            thermal.check_and_cool()
-            # The first game of each iteration is the one on the board.
-            # Every other game starts from a practice board (K+Q or K+R vs K).
-            data = worker.play_game(
-                live=live if g == 0 else None,
-                hold=0.03 if g == 0 else 0.0,
-                practice=g % 2 == 1,
+
+def run_selfplay_phase(
+    worker: SelfPlayWorker,
+    games: int,
+    iteration: int,
+    max_game_error_rate: float,
+    metrics_path: Path,
+    *,
+    live: LiveBoard | None = None,
+    thermal: ThermalGuard | None = None,
+) -> tuple[list[Any], SelfPlayStats]:
+    """Run self-play while tolerating a bounded number of game-level failures."""
+
+    if games <= 0:
+        raise ValueError("games must be positive")
+    if not 0.0 <= max_game_error_rate < 1.0:
+        raise ValueError("max_game_error_rate must be in [0, 1)")
+
+    all_data: list[Any] = []
+    stats = SelfPlayStats(games_requested=games)
+    allowed_errors = _allowed_game_errors(games, max_game_error_rate)
+
+    for game_index in range(games):
+        practice = game_index % 2 == 1
+        stats.games_attempted += 1
+        if practice:
+            stats.practice_games += 1
+
+        try:
+            if thermal is not None:
+                thermal.check_and_cool()
+            data = worker.play_game(live=live, practice=practice)
+        except Exception as exc:
+            stats.game_errors += 1
+            error_traceback = traceback.format_exc()
+            LOGGER.warning(
+                "Self-play game %d failed; dropping it and continuing:\n%s",
+                game_index + 1,
+                error_traceback,
             )
-            all_data.extend(data)
-            if g % 2 == 1:
-                practice_played += 1
-                practice_mates += int(worker.last_termination == "CHECKMATE")
-            print(f"Completed game {g+1}/{num_games}")
-            thermal.rest(2.0) # 2s breather to dissipate heat between games
+            _log_record(
+                metrics_path,
+                "game_error",
+                iteration_idx=iteration,
+                game_index=game_index + 1,
+                mate_practice=practice,
+                error=repr(exc),
+                traceback=error_traceback,
+            )
+            if stats.game_errors > allowed_errors:
+                raise RuntimeError(
+                    "Self-play error budget exceeded: "
+                    f"{stats.game_errors} errors > {allowed_errors} allowed"
+                ) from exc
+            continue
 
-        total_practice += practice_played
-        total_practice_mates += practice_mates
-        print(
-            f"[practice] iteration {iteration}: {practice_mates}/{practice_played} mated | "
-            f"run total {total_practice_mates}/{total_practice}"
-        )
-                
-        # Save the dataset
-        os.makedirs("data", exist_ok=True)
-        filename = f"data/selfplay_iter_{iteration}_{int(time.time())}.pt"
-        torch.save(all_data, filename)
-        print(f"Saved {len(all_data)} moves to {filename}")
-        
-        # ---------------------------------------------------------
-        # PHASE 2: TRAIN (Update Neural Network)
-        # ---------------------------------------------------------
-        thermal.check_and_cool()
-        print(f"======================================")
-        print(f"       ITERATION {iteration} - TRAINING")
-        print(f"======================================")
-        
-        # Train loads recent .pt files in data/ and saves tabula_v0.2_latest.pth
-        train(live=live)
-        thermal.rest(3.0) # 3s breather after backpropagation
-
-        if mate_exam_every and (finished + 1) % mate_exam_every == 0:
-            print(f"[mate exam] after iteration {iteration}")
-            run_mate_exam(chall_path, out_path=f"data/mate_exam_iter_{iteration}.json")
-        
-        # ---------------------------------------------------------
-        # PHASE 3: EVALUATE (Arena Gating)
-        # ---------------------------------------------------------
-        thermal.check_and_cool()
-        print(f"======================================")
-        print(f"       ITERATION {iteration} - ARENA")
-        print(f"======================================")
-        
-        # If there's no champion yet, skip arena and just promote the challenger
-        if arena_games <= 0:
-            print("Arena skipped (--arena-games 0).")
-        elif not os.path.exists(champ_path):
-            print("No champion found. Promoting the first trained network to Champion!")
-            shutil.copy(chall_path, champ_path)
-            live.note_match(1.0, 0, True, first=True)
+        stats.games_completed += 1
+        termination = worker.last_termination
+        if practice:
+            if termination == "CHECKMATE":
+                stats.practice_mates += 1
+            elif not data:
+                stats.stalled_rollouts_dropped += 1
         else:
-            # The exam is at least as deep as self-play. Arena results come only
-            # from chess rules, Syzygy, or the 200-ply safety-rail draw.
-            arena = Arena(
-                champion_path=champ_path,
-                challenger_path=chall_path,
-                num_simulations=ARENA_SIMULATIONS,
-                num_res_blocks=DEFAULT_RES_BLOCKS,
-            )
-            promoted = arena.evaluate(num_games=arena_games, win_threshold=0.55, live=live, hold=0.02)
-            live.note_match(
-                arena.last_win_rate,
-                arena.last_games,
-                promoted,
-                ch_wins=arena.challenger_wins,
-                ch_losses=arena.champion_wins,
-                draws=arena.draws
-            )
-            
-        print(f"\nIteration {iteration} complete. Cooling down 10 seconds before next cycle...")
-        thermal.rest(10.0)
-        thermal.check_and_cool()
-        finished += 1
-        iteration += 1
-        if max_iter is not None and finished >= max_iter:
-            print(f"[Zero] Stopped after {finished} iteration(s) (started at {start_iteration}).")
-            break
+            stats.full_board_games += 1
+            if termination == "MOVE_LIMIT":
+                stats.cap_terminations += 1
+
+        all_data.extend(data)
+
+    if stats.games_completed == 0:
+        raise RuntimeError("All self-play games failed; no training data was produced")
+    if stats.game_errors / games > max_game_error_rate:
+        raise RuntimeError(
+            "Self-play error rate exceeded: "
+            f"{stats.game_errors}/{games} > {max_game_error_rate:.0%}"
+        )
+    if not all_data:
+        raise RuntimeError("Self-play completed but produced no replay examples")
+
+    stats.replay_examples = len(all_data)
+    return all_data, stats
+
+
+def _seed_weights(paths: RunPaths, checkpoint: dict[str, Any] | None) -> Path | None:
+    """Resolve raw weights for self-play, reconstructing them from a checkpoint."""
+
+    if checkpoint is not None:
+        # Raw files are derived artifacts. Rebuild them even when an older one
+        # exists, because preemption may have landed after the canonical
+        # versioned checkpoint but before its raw-weight mirrors.
+        atomic_torch_save(checkpoint["model_state"], paths.latest_weights)
+        if checkpoint.get("metadata", {}).get("metrics", {}).get("promoted"):
+            atomic_torch_save(checkpoint["model_state"], paths.champion_weights)
+        return paths.latest_weights
+    for candidate in (paths.latest_weights, LEGACY_LATEST, paths.champion_weights, LEGACY_CHAMPION):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _iteration_metrics(
+    iteration: int,
+    stats: SelfPlayStats,
+    result: TrainResult,
+    duration_seconds: float,
+    peak_cuda_mib: float,
+    arena_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "event": "iteration_complete",
+        "timestamp": utc_now(),
+        "iteration_idx": iteration,
+        "policy_loss": result.policy_loss,
+        "value_loss": result.value_loss,
+        "total_loss": result.total_loss,
+        "learning_rate": result.learning_rate,
+        "cap_termination_rate": stats.cap_termination_rate,
+        "games_completed": stats.games_completed,
+        "games_attempted": stats.games_attempted,
+        "game_errors": stats.game_errors,
+        "stalled_rollouts_dropped": stats.stalled_rollouts_dropped,
+        "replay_examples": stats.replay_examples,
+        "peak_cuda_memory_mib": peak_cuda_mib,
+        "iteration_seconds": duration_seconds,
+        **arena_metrics,
+    }
+
+
+def _print_iteration_metrics(metrics: dict[str, Any]) -> None:
+    print(
+        "Iteration {iteration_idx} complete | policy_loss={policy_loss:.6f} "
+        "value_loss={value_loss:.6f} total_loss={total_loss:.6f} | "
+        "cap_termination_rate={cap_termination_rate:.3f} | games={games_completed}/"
+        "{games_attempted} errors={game_errors} stalled_dropped={stalled_rollouts_dropped} | "
+        "peak_cuda_memory={peak_cuda_memory_mib:.1f} MiB".format(**metrics)
+    )
+    if metrics["cap_termination_rate"] > 0.15:
+        LOGGER.warning(
+            "CAP TERMINATION TRIPWIRE: %.1f%% exceeds 15%%",
+            metrics["cap_termination_rate"] * 100,
+        )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run durable Tabula Zero training")
+    parser.add_argument("--games", type=int, default=5, help="Self-play games per iteration")
+    parser.add_argument("--iterations", type=int, default=10000)
+    parser.add_argument("--arena-games", type=int, default=0)
+    parser.add_argument("--mate-exam-every", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument(
+        "--output-dir",
+        default=os.environ.get("ZERO_OUTPUT_DIR", "./checkpoints"),
+    )
+    parser.add_argument("--time-limit-hours", type=float, default=7.5)
+    parser.add_argument("--max-game-error-rate", type=float, default=0.20)
+    parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--no-tui", action="store_true")
+    return parser.parse_args(argv)
+
+
+def run(args: argparse.Namespace) -> int:
+    """Execute the training loop. A failed iteration never replaces its predecessor."""
+
+    if args.iterations <= 0:
+        raise ValueError("iterations must be positive")
+    if args.games <= 0:
+        raise ValueError("games must be positive")
+    if args.arena_games < 0:
+        raise ValueError("arena_games cannot be negative")
+    if args.batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if args.epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if args.mate_exam_every < 0:
+        raise ValueError("mate_exam_every cannot be negative")
+    if not 0.0 <= args.max_game_error_rate < 1.0:
+        raise ValueError("max_game_error_rate must be in [0, 1)")
+    if args.time_limit_hours <= 0:
+        raise ValueError("time_limit_hours must be positive")
+    paths = RunPaths.from_value(args.output_dir)
+    paths.ensure()
+
+    # This must happen before a worker, model, or training allocation is created.
+    tablebase, syzygy_path = require_syzygy()
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    checkpoint_path = None if args.no_resume else latest_checkpoint(paths)
+    if args.no_resume and latest_checkpoint(paths) is not None:
+        raise RuntimeError(
+            "--no-resume cannot reuse an output directory containing checkpoints; "
+            "choose a new --output-dir"
+        )
+    checkpoint = (
+        load_checkpoint(checkpoint_path, map_location=device)
+        if checkpoint_path is not None
+        else None
+    )
+    iteration = int(checkpoint.get("iteration", 0)) + 1 if checkpoint else 1
+    final_iteration = iteration + args.iterations - 1
+    model_path = _seed_weights(paths, checkpoint)
+
+    thermal = ThermalGuard()
+    budget = WallClockBudget(args.time_limit_hours)
+    previous_iteration_seconds: float | None = None
+    live = None if args.no_tui else LiveBoard()
+
+    print(f"Device: {device}")
+    print(f"Syzygy: {syzygy_path}")
+    print(f"Output: {paths.root}")
+    if checkpoint_path is not None:
+        print(f"Resuming from {checkpoint_path.name} at iteration {iteration}")
+
+    try:
+        while iteration <= final_iteration:
+            can_start, reason = budget.can_start_iteration(previous_iteration_seconds)
+            if not can_start:
+                message = f"Graceful stop before iteration {iteration}: {reason}"
+                print(message)
+                _log_record(
+                    paths.metrics_path,
+                    "time_budget_stop",
+                    iteration_idx=iteration,
+                    reason=reason,
+                    elapsed_seconds=budget.elapsed_seconds,
+                )
+                return 0
+
+            started = time.monotonic()
+            candidate_path: Path | None = None
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+
+            try:
+                if live is not None:
+                    live.begin_round(iteration, model_path is not None)
+                worker = SelfPlayWorker(
+                    model_path=model_path,
+                    num_simulations=DEFAULT_SIMULATIONS,
+                    num_res_blocks=DEFAULT_RES_BLOCKS,
+                    tablebase=tablebase,
+                )
+                replay, stats = run_selfplay_phase(
+                    worker,
+                    args.games,
+                    iteration,
+                    args.max_game_error_rate,
+                    paths.metrics_path,
+                    live=live,
+                    thermal=thermal,
+                )
+                atomic_torch_save(replay, paths.replay_path(iteration))
+
+                result = train(
+                    data_dir=paths.replay_dir,
+                    model_path=model_path,
+                    checkpoint=checkpoint,
+                    batch_size=args.batch_size,
+                    epochs=args.epochs,
+                    device=device,
+                    live=live,
+                )
+
+                candidate_path = paths.root / f".candidate_iter_{iteration:04d}.pt"
+                atomic_torch_save(result.model.state_dict(), candidate_path)
+                if args.mate_exam_every and iteration % args.mate_exam_every == 0:
+                    run_mate_exam(
+                        str(candidate_path),
+                        out_path=str(paths.root / f"mate_exam_iter_{iteration:04d}.json"),
+                    )
+                promoted = not paths.champion_weights.exists()
+                arena_metrics: dict[str, Any] = {
+                    "arena_games": 0,
+                    "arena_wins": 0,
+                    "arena_losses": 0,
+                    "arena_draws": 0,
+                    "arena_win_rate": None,
+                    "promoted": promoted,
+                }
+                if args.arena_games > 0 and paths.champion_weights.exists():
+                    arena = Arena(
+                        champion_path=paths.champion_weights,
+                        challenger_path=candidate_path,
+                        tablebase=tablebase,
+                    )
+                    promoted = arena.evaluate(
+                        num_games=args.arena_games,
+                        live=live,
+                        promote=False,
+                    )
+                    arena_metrics = {
+                        "arena_games": arena.last_games,
+                        "arena_wins": arena.last_wins,
+                        "arena_losses": arena.last_losses,
+                        "arena_draws": arena.last_draws,
+                        "arena_win_rate": arena.last_win_rate,
+                        "promoted": promoted,
+                    }
+                    if live is not None:
+                        live.note_match(
+                            arena.last_win_rate,
+                            arena.last_games,
+                            promoted,
+                            ch_wins=arena.last_wins,
+                            ch_losses=arena.last_losses,
+                            draws=arena.last_draws,
+                        )
+                elif live is not None and promoted:
+                    live.note_match(1.0, 0, True, first=True)
+
+                duration = time.monotonic() - started
+                peak_memory = peak_cuda_memory_mib(device)
+                metrics = _iteration_metrics(
+                    iteration,
+                    stats,
+                    result,
+                    duration,
+                    peak_memory,
+                    arena_metrics,
+                )
+                payload = checkpoint_payload(
+                    iteration=iteration,
+                    model_state=result.model.state_dict(),
+                    optimizer_state=result.optimizer.state_dict(),
+                    scheduler_state=result.scheduler.state_dict(),
+                    metadata={
+                        "metrics": metrics,
+                        "config": vars(args),
+                        "selfplay": asdict(stats),
+                        "syzygy_path": str(syzygy_path),
+                    },
+                )
+
+                # The versioned checkpoint is canonical and written first. Raw
+                # weights are reconstructable from it if preemption lands between files.
+                atomic_torch_save(payload, paths.checkpoint_path(iteration))
+                atomic_torch_save(result.model.state_dict(), paths.latest_weights)
+                if promoted:
+                    atomic_torch_save(result.model.state_dict(), paths.champion_weights)
+                atomic_jsonl_append(paths.metrics_path, metrics)
+                candidate_path.unlink(missing_ok=True)
+
+                _print_iteration_metrics(metrics)
+                checkpoint = payload
+                model_path = paths.latest_weights
+                previous_iteration_seconds = duration
+                iteration += 1
+            except Exception as exc:
+                if candidate_path is not None:
+                    candidate_path.unlink(missing_ok=True)
+                error_traceback = traceback.format_exc()
+                LOGGER.error(
+                    "Iteration %d failed; the previous checkpoint remains intact:\n%s",
+                    iteration,
+                    error_traceback,
+                )
+                _log_record(
+                    paths.metrics_path,
+                    "iteration_error",
+                    iteration_idx=iteration,
+                    error=repr(exc),
+                    traceback=error_traceback,
+                )
+                raise
+    except KeyboardInterrupt:
+        print("Stopped by user; the last complete checkpoint remains intact.")
+        return 0
+    finally:
+        tablebase.close()
+        if live is not None and live.tui is not None:
+            live.tui.close()
+
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    return run(parse_args(argv))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Zero self-play / train / arena loop")
-    parser.add_argument("--max-iter", type=int, default=None, help="stop after this many iterations")
-    parser.add_argument("--games", type=int, default=5, help="self-play games per iteration")
-    parser.add_argument("--arena-games", type=int, default=20, help="arena games per iteration")
-    parser.add_argument("--no-tui", action="store_true", help="disable the live TUI")
-    parser.add_argument("--mate-exam-every", type=int, default=0, help="run the mate exam every N iterations (0 = off)")
-    args = parser.parse_args()
-    try:
-        main(
-            max_iter=args.max_iter,
-            num_games=args.games,
-            arena_games=args.arena_games,
-            enable_tui=not args.no_tui,
-            mate_exam_every=args.mate_exam_every,
-        )
-    except KeyboardInterrupt:
-        import sys
-        sys.stdout.write("\033[?25h\n\n[Zero] Pipeline paused cleanly by user.\n")
-        sys.stdout.flush()
+    sys.exit(main())

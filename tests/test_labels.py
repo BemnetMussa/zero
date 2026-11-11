@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from tabula.game.encoder import encode_board
+from tabula import runtime
 from tabula.evaluate import arena
 from tabula.mcts import search
 from tabula.mcts.search import terminal_value
@@ -167,6 +168,69 @@ class SyzygyConfigurationTests(unittest.TestCase):
             ):
                 self.assertEqual(open_tablebase(), "tablebase")
         opener.assert_called_once_with(tmp)
+
+    def test_strict_runtime_rejects_unset_or_missing_path(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "SYZYGY_PATH is required"):
+                runtime.require_syzygy()
+        with mock.patch.dict(
+            os.environ,
+            {"SYZYGY_PATH": "/definitely/not/a/tablebase"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "does not exist"):
+                runtime.require_syzygy()
+
+    def test_strict_runtime_probes_kqk_and_krk(self) -> None:
+        class ProbeTablebase:
+            def __init__(self):
+                self.boards = []
+                self.closed = False
+
+            def probe_wdl(self, board):
+                self.boards.append(board.copy())
+                return 2
+
+            def probe_dtz(self, _board):
+                return 1
+
+            def close(self):
+                self.closed = True
+
+        tablebase = ProbeTablebase()
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "KQvK.rtbw").touch()
+            Path(tmp, "KQvK.rtbz").touch()
+            with (
+                mock.patch.dict(os.environ, {"SYZYGY_PATH": tmp}, clear=True),
+                mock.patch.object(
+                    runtime.chess.syzygy,
+                    "open_tablebase",
+                    return_value=tablebase,
+                ),
+            ):
+                opened, resolved = runtime.require_syzygy()
+
+        self.assertIs(opened, tablebase)
+        self.assertEqual(resolved, Path(tmp).resolve())
+        self.assertEqual(len(tablebase.boards), 2)
+        symbols = [{piece.symbol().lower() for piece in board.piece_map().values()} for board in tablebase.boards]
+        self.assertIn({"k", "q"}, symbols)
+        self.assertIn({"k", "r"}, symbols)
+
+    def test_probe_failure_closes_tables_and_fails_fast(self) -> None:
+        failing = mock.Mock()
+        failing.probe_wdl.side_effect = KeyError("missing table")
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "KQvK.rtbw").touch()
+            Path(tmp, "KQvK.rtbz").touch()
+            with (
+                mock.patch.dict(os.environ, {"SYZYGY_PATH": tmp}, clear=True),
+                mock.patch.object(runtime.chess.syzygy, "open_tablebase", return_value=failing),
+                self.assertRaisesRegex(RuntimeError, "mandatory KQK/KRK probe failed"),
+            ):
+                runtime.require_syzygy()
+        failing.close.assert_called_once()
 
 
 @unittest.skipIf(TABLEBASE is None, "no Syzygy tables (syzygy/345 or $SYZYGY_PATH)")

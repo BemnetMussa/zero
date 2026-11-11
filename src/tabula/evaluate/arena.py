@@ -5,6 +5,7 @@ import torch
 from tabula.model.model import TabulaNet
 from tabula.mcts.search import MCTS
 from tabula.game.encoder import encode_board
+from tabula.runtime import atomic_torch_save
 from tabula.selfplay.labels import MAX_PLIES, game_result, in_tablebase, open_tablebase
 
 DEFAULT_RES_BLOCKS = 8
@@ -146,7 +147,14 @@ class Arena:
             return (white_reward + 1.0) / 2.0
         return (1.0 - white_reward) / 2.0
 
-    def evaluate(self, num_games=10, win_threshold=0.55, live=None, hold=0.0):
+    def evaluate(
+        self,
+        num_games=10,
+        win_threshold=0.55,
+        live=None,
+        hold=0.0,
+        promote=True,
+    ):
         """
         Plays a tournament. If Challenger scores > win_threshold (e.g. 55%), 
         it becomes the new Champion.
@@ -211,6 +219,9 @@ class Arena:
         win_rate = challenger_score / num_games
         self.last_win_rate = win_rate
         self.last_games = num_games
+        self.last_wins = challenger_wins
+        self.last_losses = champion_wins
+        self.last_draws = draws
         self.challenger_wins = challenger_wins
         self.champion_wins = champion_wins
         self.draws = draws
@@ -218,9 +229,9 @@ class Arena:
         
         if win_rate >= win_threshold:
             print("GATING PASSED: Challenger is strictly better!")
-            print(f"Promoting Challenger to new Champion at {self.champion_path}...")
-            # Overwrite the champion weights with the challenger weights
-            torch.save(self.challenger.state_dict(), self.champion_path)
+            if promote:
+                print(f"Promoting Challenger to new Champion at {self.champion_path}...")
+                atomic_torch_save(self.challenger.state_dict(), self.champion_path)
             return True
         else:
             print("GATING FAILED: Challenger rejected. Keeping old Champion.")

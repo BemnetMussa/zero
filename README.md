@@ -59,6 +59,19 @@ You are White. Type `e2e4` or `e4`. Quit with `q`.
 PYTHONPATH=src .venv/bin/python -m tabula.pipeline --no-tui
 ```
 
+Point the same code at the machine's Syzygy 3–5 piece tables:
+
+```bash
+# Local
+export SYZYGY_PATH=/home/voare/Documents/AI/tabula/syzygy/345
+
+# Kaggle (use the mounted dataset's actual folder)
+export SYZYGY_PATH=/kaggle/input/<dataset-name>/345
+```
+
+If `SYZYGY_PATH` is unset, Zero checks `syzygy/345` and then
+`/kaggle/input/syzygy-345`.
+
 Useful flags:
 
 | Flag | Meaning |

@@ -5,10 +5,8 @@ import torch
 from tabula.model.model import TabulaNet
 from tabula.mcts.search import MCTS
 from tabula.game.encoder import encode_board
-from tabula.game.score import ADJUDICATE_LEAD, ADJUDICATE_PLIES, material_white, score_game
+from tabula.selfplay.labels import MAX_PLIES, game_result, in_tablebase, open_tablebase
 
-# v0.2: material/move-limit cutoffs count less than real mates in the gate.
-ARENA_ADJUDICATE_SCALE = 0.5
 DEFAULT_RES_BLOCKS = 8
 
 # 10 openings × 2 colors = 20 unique paired games (matches pipeline num_games=20).
@@ -27,7 +25,14 @@ OPENING_SUITE = [
 ]
 
 class Arena:
-    def __init__(self, champion_path, challenger_path, num_simulations=100, num_res_blocks=DEFAULT_RES_BLOCKS):
+    def __init__(
+        self,
+        champion_path,
+        challenger_path,
+        num_simulations=100,
+        num_res_blocks=DEFAULT_RES_BLOCKS,
+        tablebase=None,
+    ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Arena running on: {self.device} ({num_res_blocks} ResBlocks, {num_simulations} sims)")
         
@@ -50,6 +55,7 @@ class Arena:
         # 3. Setup MCTS for both
         self.champ_mcts = MCTS(self.champion, num_simulations=num_simulations)
         self.chall_mcts = MCTS(self.challenger, num_simulations=num_simulations)
+        self.tablebase = tablebase if tablebase is not None else open_tablebase()
         
         self.champion_path = champion_path
 
@@ -66,7 +72,6 @@ class Arena:
 
         moves = len(board.move_stack)
         stop = None
-        lead_run = 0
         
         # Assign colors
         white_mcts = self.chall_mcts if challenger_is_white else self.champ_mcts
@@ -107,24 +112,19 @@ class Arena:
             last_move = best_move
             moves += 1
 
-            if abs(material_white(board)) >= ADJUDICATE_LEAD:
-                lead_run += 1
-            else:
-                lead_run = 0
-            if lead_run >= ADJUDICATE_PLIES:
-                stop = "MATERIAL"
+            if board.outcome(claim_draw=True) is None and in_tablebase(board, self.tablebase):
+                stop = "TABLEBASE"
                 break
 
-            # Cap moves to prevent infinite loops from bad networks
-            if moves > 150:
+            # Algorithmic safety rail, not a chess rule. A game that reaches it
+            # is a draw; no material score is allowed in the arena gate.
+            if moves >= MAX_PLIES:
                 stop = "MOVE_LIMIT"
                 break
 
-        # Mate is a full point. A rules draw is half. A game we cut off is scored
-        # from the material, so a queen-up challenger is not recorded as a draw.
-        outcome = board.outcome(claim_draw=True)
-        white_reward, result, termination = score_game(
-            board, outcome, stop, adjudicate_scale=ARENA_ADJUDICATE_SCALE
+        # Arena and self-play use the same rule/tablebase result semantics.
+        white_reward, result, termination = game_result(
+            board, stop, practice=False, tablebase=self.tablebase
         )
         self.last_result = f"{result} ({termination}) white {white_reward:+.2f}"
         if live is not None:

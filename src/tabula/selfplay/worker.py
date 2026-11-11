@@ -8,7 +8,7 @@ from tabula.model.model import TabulaNet
 from tabula.mcts.search import MCTS
 from tabula.game.encoder import encode_board, needs_orient, orient_move
 from tabula.game.action_encoder import ActionEncoder
-from tabula.game.score import ADJUDICATE_LEAD, ADJUDICATE_PLIES, material_white, score_game
+from tabula.selfplay.labels import MAX_PLIES, Record, game_result, in_tablebase, label_game, open_tablebase
 from tabula.selfplay.practice import random_practice_board
 
 # v0.2 defaults (AlphaZero used 800; laptop budget stays far below that).
@@ -17,10 +17,9 @@ DEFAULT_SIMULATIONS = 80
 # v0.3 playout cap (KataGo §3.1): most turns are cheap; only full turns train π.
 FAST_SIMULATIONS = 16
 FULL_SEARCH_P = 0.25
-LATE_WEIGHT_FLOOR = 0.2
 
 class SelfPlayWorker:
-    def __init__(self, model_path=None, num_simulations=DEFAULT_SIMULATIONS, num_res_blocks=DEFAULT_RES_BLOCKS):
+    def __init__(self, model_path=None, num_simulations=DEFAULT_SIMULATIONS, num_res_blocks=DEFAULT_RES_BLOCKS, tablebase=None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Initializing TabulaNet for Self-Play on {self.device} ({num_res_blocks} ResBlocks, {num_simulations} sims)...")
         self.model = TabulaNet(num_res_blocks=num_res_blocks).to(self.device)
@@ -31,6 +30,8 @@ class SelfPlayWorker:
         
         self.mcts = MCTS(self.model, num_simulations=num_simulations, c_puct=1.25)
         self.action_encoder = ActionEncoder()
+        self.tablebase = tablebase if tablebase is not None else open_tablebase()
+        print(f"Syzygy tablebase: {'loaded' if self.tablebase else 'not found (labels from game results only)'}")
 
     def play_game(self, render=False, delay=0.5, live=None, hold=0.0, sampling_moves=30, practice=False):
         """Plays a single game of Zero vs Zero and returns the training examples.
@@ -40,14 +41,14 @@ class SelfPlayWorker:
         fast quiet search (n sims, no noise) just to move the game forward.
 
         practice=True starts from a K+Q or K+R vs K board instead of the normal
-        start. The material stop is off there: the extra piece is the whole
-        point, so only mate counts as finishing.
+        start. Only mate counts as finishing there; anything else is dropped.
+        A normal game stops when it enters the tablebase or hits MAX_PLIES.
         """
         if practice:
             board, practice_side = random_practice_board()
         else:
             board, practice_side = chess.Board(), None
-        examples = []  # (board_tensor, pi, player_turn, ply, v_prior, q_root)
+        records = []
         last_move = None
         full_turns = 0
         fast_turns = 0
@@ -60,7 +61,6 @@ class SelfPlayWorker:
 
         moves = 0
         stop = None
-        lead_run = 0
         while board.outcome(claim_draw=True) is None:
             if render:
                 os.system('cls' if os.name == 'nt' else 'clear')
@@ -122,8 +122,15 @@ class SelfPlayWorker:
 
             # 3. Only full-search turns enter the training buffer.
             if is_full and policy:
-                state_tensor = encode_board(board)
-                examples.append([state_tensor, pi, board.turn, moves, float(v_prior), float(root_node.q_value)])
+                records.append(Record(
+                    state=encode_board(board),
+                    pi=pi,
+                    turn=board.turn,
+                    ply=moves,
+                    v_prior=float(v_prior),
+                    q_root=float(root_node.q_value),
+                    fen=board.fen(),
+                ))
 
             # 4. Push the move to the board
             board.push(played)
@@ -133,28 +140,18 @@ class SelfPlayWorker:
             if not render and moves % 10 == 0:
                 print(f"Move {moves}... (Eval: {root_node.q_value:.2f})")
 
-            # A held material lead is a decided game for a net that cannot find mate yet.
-            # Scoring that 0 is what glued the value head to "everything is a draw".
-            if practice_side is None and abs(material_white(board)) >= ADJUDICATE_LEAD:
-                lead_run += 1
-            else:
-                lead_run = 0
-            if lead_run >= ADJUDICATE_PLIES:
-                stop = "MATERIAL"
-                print("One side kept a piece lead. Scoring the game from the material.")
+            # Practice boards start inside the tables, so only normal games stop here.
+            if practice_side is None and board.outcome(claim_draw=True) is None and in_tablebase(board, self.tablebase):
+                stop = "TABLEBASE"
                 break
 
-            # Cap max moves so a wandering game cannot run forever.
-            if moves > 150:
+            if moves >= MAX_PLIES:
                 stop = "MOVE_LIMIT"
-                print("Hit 150 move limit. Scoring the unfinished game from the material.")
+                print(f"Hit the {MAX_PLIES}-ply cap.")
                 break
 
-        # 5. Game Over - Calculate Rewards (z)
-        # Mate stays ±1. A draw the rules produced stays 0. Anything we cut off
-        # is the material on the board, or the value head never sees a winner.
-        outcome = board.outcome(claim_draw=True)
-        reward, result, termination = score_game(board, outcome, stop, practice_side=practice_side)
+        # 5. Game over: result for the log and the live view.
+        reward, result, termination = game_result(board, stop, practice_side is not None, self.tablebase)
         self.last_termination = termination
 
         if render:
@@ -166,7 +163,7 @@ class SelfPlayWorker:
         kind = "Practice game" if practice_side is not None else "Game"
         print(
             f"{kind} over after {moves} plies. {result} ({termination}). "
-            f"Reward for White: {reward} | recorded {len(examples)}/{moves} "
+            f"Reward for White: {reward} | recorded {len(records)}/{moves} "
             f"(full={full_turns} fast={fast_turns})"
         )
         if live is not None:
@@ -186,22 +183,8 @@ class SelfPlayWorker:
             if hold:
                 time.sleep(max(hold, 1.0))
         
-        # 6. Assign z and a LATE × surprise sample weight to each full-search turn.
-        training_data = []
-        total_plies = max(moves, 1)
-        for state_tensor, pi, player_turn, ply, v_prior, q_root in examples:
-            actual_reward = reward if player_turn == chess.WHITE else -reward
-            late = LATE_WEIGHT_FLOOR + (1.0 - LATE_WEIGHT_FLOOR) * (ply / total_plies)
-            surprise = 1.0 + abs(v_prior - q_root)
-            weight = float(late * surprise)
-            training_data.append((
-                state_tensor,
-                pi,
-                np.array([actual_reward], dtype=np.float32),
-                np.array([weight], dtype=np.float32),
-            ))
-            
-        return training_data
+        # 6. Discounted z and a LATE × surprise weight for each full-search turn.
+        return label_game(records, board, stop, practice_side is not None, self.tablebase)
 
 def _choose_move(root, selection):
     """Sample proportional to visits for the opening, then take the most visited move."""

@@ -166,7 +166,8 @@ def main(max_iter=None, num_games=5, arena_games=20, enable_tui=True, mate_exam_
             shutil.copy(chall_path, champ_path)
             live.note_match(1.0, 0, True, first=True)
         else:
-            # v0.2: exam ≥ self-play depth; soft material scoring inside Arena.
+            # The exam is at least as deep as self-play. Arena results come only
+            # from chess rules, Syzygy, or the 200-ply safety-rail draw.
             arena = Arena(
                 champion_path=champ_path,
                 challenger_path=chall_path,

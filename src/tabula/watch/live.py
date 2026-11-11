@@ -58,16 +58,13 @@ def _phase_label(iteration, phase):
 
 def _finished_game(result, termination, moves):
     names = {
-        "WHITE AHEAD": "White is ahead",
-        "BLACK AHEAD": "Black is ahead",
         "WHITE WINS": "White won",
         "BLACK WINS": "Black won",
         "DRAW": "Draw",
-        "LEVEL": "Even on material",
     }
     why = {
-        "MATERIAL": "A piece lead held, so the game was scored from the material.",
-        "MOVE_LIMIT": "Hit the move cap. Scored from the material.",
+        "MOVE_LIMIT": "Hit the 200-ply safety rail, so the game is a draw.",
+        "TABLEBASE": "Five pieces or fewer: the Syzygy tables decided the result.",
         "THREEFOLD_REPETITION": "The position repeated.",
         "FIVEFOLD_REPETITION": "The position repeated.",
         "FIFTY_MOVES": "Fifty moves without a capture or a pawn move.",
@@ -78,7 +75,7 @@ def _finished_game(result, termination, moves):
     }
     title = names.get(result, result or "Game over")
     reason = why.get(termination or "", (termination or "").replace("_", " ").lower())
-    tone = "bad" if title in ("Draw", "Eval is flat") else "good" if title != "Even on material" else "wait"
+    tone = "bad" if title in ("Draw", "Eval is flat") else "good"
     return title, f"{reason} {moves} plies.".strip(), tone
 
 

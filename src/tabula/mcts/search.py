@@ -3,26 +3,19 @@ import numpy as np
 import torch
 import chess
 
-from tabula.game.score import is_repetition_draw, repetition_draw_reward
-
 FORCED_PLAYOUT_K = 2.0
 
 
 def terminal_value(board):
     """Value for the side to move, or None if the game is still going.
 
-    A draw the rules will claim (repetition, the 50-move rule) is 0,
-    except a repetition while one side is ahead: that side is penalized
-    (v0.3 comfort-draw contempt) so search will not hide in a threefold.
-    Checkmate is -1 for the side that has to move.
+    Every draw the rules produce is 0. Checkmate is -1 for the side that
+    has to move. No material values or repetition contempt enter search.
     """
     outcome = board.outcome(claim_draw=True)
     if outcome is None:
         return None
     if outcome.winner is None:
-        if is_repetition_draw(outcome):
-            white_reward = repetition_draw_reward(board)
-            return white_reward if board.turn == chess.WHITE else -white_reward
         return 0.0
     return 1.0 if outcome.winner == board.turn else -1.0
 

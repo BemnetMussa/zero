@@ -19,6 +19,13 @@ logs/
 *.ckpt
 *.onnx
 
+# Syzygy endgame tables (~1 GB, downloaded)
+syzygy/
+
+# Downloaded Kaggle weights, reports, and notebook logs
+kaggle_night/
+kaggle_practice/
+
 # Training Data
 data/
 *.pt

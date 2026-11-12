@@ -96,6 +96,7 @@ Useful flags:
 | --- | --- |
 | `--iterations 200` | Run at most this many loops |
 | `--games 5` | Self-play games per loop (every other one starts from a practice board) |
+| `--simulations 80` | Full-search MCTS visits per move |
 | `--arena-games 0` | Skip the match (faster cook) |
 | `--mate-exam-every 50` | Re-test K+Q / K+R vs K every 50 loops |
 | `--output-dir PATH` | Store checkpoints, replay, and metrics under this directory |

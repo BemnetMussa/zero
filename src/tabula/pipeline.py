@@ -248,6 +248,12 @@ def _storage_ready(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run durable Tabula Zero training")
     parser.add_argument("--games", type=int, default=5, help="Self-play games per iteration")
+    parser.add_argument(
+        "--simulations",
+        type=int,
+        default=DEFAULT_SIMULATIONS,
+        help="Full-search MCTS simulations per move",
+    )
     parser.add_argument("--iterations", type=int, default=10000)
     parser.add_argument("--arena-games", type=int, default=0)
     parser.add_argument("--mate-exam-every", type=int, default=50)
@@ -275,6 +281,8 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("iterations must be positive")
     if args.games <= 0:
         raise ValueError("games must be positive")
+    if args.simulations <= 0:
+        raise ValueError("simulations must be positive")
     if args.arena_games < 0:
         raise ValueError("arena_games cannot be negative")
     if args.batch_size <= 0:
@@ -367,7 +375,7 @@ def run(args: argparse.Namespace) -> int:
                     live.begin_round(iteration, model_path is not None)
                 worker = SelfPlayWorker(
                     model_path=model_path,
-                    num_simulations=DEFAULT_SIMULATIONS,
+                    num_simulations=args.simulations,
                     num_res_blocks=DEFAULT_RES_BLOCKS,
                     tablebase=tablebase,
                 )

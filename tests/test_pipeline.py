@@ -118,6 +118,10 @@ class SelfPlayResilienceTests(unittest.TestCase):
 
 
 class PipelineArtifactTests(unittest.TestCase):
+    def test_simulation_budget_is_configurable(self) -> None:
+        args = pipeline.parse_args(["--simulations", "30"])
+        self.assertEqual(args.simulations, 30)
+
     def test_low_disk_startup_exits_cleanly_before_syzygy_or_workers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args = pipeline.parse_args(

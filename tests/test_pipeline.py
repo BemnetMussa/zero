@@ -118,6 +118,22 @@ class SelfPlayResilienceTests(unittest.TestCase):
 
 
 class PipelineArtifactTests(unittest.TestCase):
+    def test_low_disk_startup_exits_cleanly_before_syzygy_or_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = pipeline.parse_args(
+                ["--no-tui", "--output-dir", tmp, "--iterations", "1"]
+            )
+            with (
+                mock.patch.object(
+                    pipeline,
+                    "check_disk_capacity",
+                    return_value=(False, 1024, {"checkpoints": [], "replays": []}),
+                ),
+                mock.patch.object(pipeline, "require_syzygy") as require_syzygy,
+            ):
+                self.assertEqual(pipeline.run(args), 0)
+            require_syzygy.assert_not_called()
+
     def test_resume_rebuilds_raw_weights_from_canonical_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = RunPaths.from_value(tmp)
@@ -165,6 +181,8 @@ class PipelineArtifactTests(unittest.TestCase):
                     "0",
                     "--mate-exam-every",
                     "0",
+                    "--snapshot-every",
+                    "1",
                     "--time-limit-hours",
                     "1",
                 ]
@@ -183,6 +201,7 @@ class PipelineArtifactTests(unittest.TestCase):
             self.assertTrue(paths.checkpoint_path(1).exists())
             self.assertTrue(paths.latest_weights.exists())
             self.assertTrue(paths.champion_weights.exists())
+            self.assertTrue(paths.snapshot_path(1).exists())
             checkpoint = load_checkpoint(paths.checkpoint_path(1))
             self.assertEqual(checkpoint["iteration"], 1)
             records = [
@@ -190,6 +209,8 @@ class PipelineArtifactTests(unittest.TestCase):
             ]
             self.assertEqual(records[-1]["event"], "iteration_complete")
             self.assertEqual(records[-1]["policy_loss"], 1.25)
+            snapshot = torch.load(paths.snapshot_path(1), weights_only=True)
+            self.assertEqual(set(snapshot), {"weight"})
             self.assertFalse(any(paths.root.glob(".candidate*")))
             self.assertTrue(tablebase.closed)
 

@@ -61,6 +61,7 @@ class SelfPlayWorker:
 
         moves = 0
         stop = None
+        root_noise_calls = 0
         while board.outcome(claim_draw=True) is None:
             if render:
                 os.system('cls' if os.name == 'nt' else 'clear')
@@ -68,7 +69,9 @@ class SelfPlayWorker:
                 print(board.unicode())
                 time.sleep(delay)
 
-            is_full = np.random.random() < FULL_SEARCH_P
+            # Curriculum positions are short and need dense, decisive labels.
+            # Normal games retain the playout cap.
+            is_full = practice_side is not None or np.random.random() < FULL_SEARCH_P
             if is_full:
                 _, v_prior = self.mcts.predict(board, encode_board)
                 root_node = self.mcts.search(
@@ -78,6 +81,7 @@ class SelfPlayWorker:
                     num_simulations=self.mcts.num_simulations,
                     force_playouts=True,
                 )
+                root_noise_calls += 1
                 policy = self.mcts.pruned_policy_target(root_node)
                 full_turns += 1
             else:
@@ -104,7 +108,17 @@ class SelfPlayWorker:
                     idx = self.action_encoder.encode(orient_move(move, flip))
                     pi[idx] = prob
 
-            selection = "sample" if (is_full and moves < sampling_moves) else "greedy"
+            # Root noise still diversifies the curriculum policy target, while
+            # greedy execution stops sampling from throwing away obvious mates.
+            selection = (
+                "sample"
+                if (
+                    practice_side is None
+                    and is_full
+                    and moves < sampling_moves
+                )
+                else "greedy"
+            )
             played = _choose_move(root_node, selection)
 
             if live is not None:
@@ -153,6 +167,7 @@ class SelfPlayWorker:
         # 5. Game over: result for the log and the live view.
         reward, result, termination = game_result(board, stop, practice_side is not None, self.tablebase)
         self.last_termination = termination
+        self.last_root_noise_calls = root_noise_calls
 
         if render:
             os.system('cls' if os.name == 'nt' else 'clear')
@@ -164,7 +179,7 @@ class SelfPlayWorker:
         print(
             f"{kind} over after {moves} plies. {result} ({termination}). "
             f"Reward for White: {reward} | recorded {len(records)}/{moves} "
-            f"(full={full_turns} fast={fast_turns})"
+            f"(full={full_turns} fast={fast_turns} noisy_roots={root_noise_calls})"
         )
         if live is not None:
             winner = "WHITE" if reward > 0.05 else ("BLACK" if reward < -0.05 else "DRAW")

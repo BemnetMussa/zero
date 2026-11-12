@@ -139,11 +139,22 @@ class MCTS:
         MCTS actually tests the challenging second choice.
         """
         if force_playouts and node.children:
+            # A root action cannot prove itself if the network assigned it a
+            # tiny prior and search never visits it. Full self-play searches
+            # give every affordable legal root move one evaluation first.
+            unvisited = [
+                (child.prior_prob, action, child)
+                for action, child in node.children.items()
+                if child.visit_count == 0
+            ]
+            if unvisited:
+                unvisited.sort(key=lambda item: item[0], reverse=True)
+                _, action, child = unvisited[0]
+                return action, child
+
             parent_visits = sum(child.visit_count for child in node.children.values())
             under = []
             for action, child in node.children.items():
-                if child.visit_count <= 0:
-                    continue
                 floor = forced_visit_floor(child.prior_prob, parent_visits)
                 if child.visit_count < floor:
                     under.append((floor - child.visit_count, child.prior_prob, action, child))

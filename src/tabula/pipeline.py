@@ -22,16 +22,18 @@ from tabula.runtime import (
     WallClockBudget,
     atomic_jsonl_append,
     atomic_torch_save,
+    check_disk_capacity,
     checkpoint_payload,
     latest_checkpoint,
     load_checkpoint,
     peak_cuda_memory_mib,
+    prune_run_artifacts,
     require_syzygy,
     utc_now,
 )
 from tabula.hardware.thermal import ThermalGuard
 from tabula.selfplay.worker import DEFAULT_RES_BLOCKS, DEFAULT_SIMULATIONS, SelfPlayWorker
-from tabula.train.train import DEFAULT_EPOCHS, TrainResult, train
+from tabula.train.train import DEFAULT_EPOCHS, DEFAULT_MAX_FILES, TrainResult, train
 from tabula.watch.live import LiveBoard
 
 LOGGER = logging.getLogger(__name__)
@@ -215,6 +217,34 @@ def _print_iteration_metrics(metrics: dict[str, Any]) -> None:
         )
 
 
+def _storage_ready(
+    paths: RunPaths,
+    *,
+    min_free_gb: float,
+    keep_checkpoints: int,
+    keep_replays: int,
+) -> bool:
+    ok, free_bytes, removed = check_disk_capacity(
+        paths,
+        min_free_bytes=int(min_free_gb * 1024**3),
+        keep_checkpoints=keep_checkpoints,
+        keep_replays=keep_replays,
+    )
+    removed_count = sum(len(items) for items in removed.values())
+    if removed_count:
+        print(
+            f"Storage cleanup removed {len(removed['checkpoints'])} old checkpoints "
+            f"and {len(removed['replays'])} old replay files."
+        )
+    free_gb = free_bytes / 1024**3
+    if not ok:
+        print(
+            f"Graceful low-disk stop: {free_gb:.2f} GiB free is below "
+            f"the {min_free_gb:.2f} GiB safety floor."
+        )
+    return ok
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run durable Tabula Zero training")
     parser.add_argument("--games", type=int, default=5, help="Self-play games per iteration")
@@ -229,6 +259,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--time-limit-hours", type=float, default=7.5)
     parser.add_argument("--max-game-error-rate", type=float, default=0.20)
+    parser.add_argument("--keep-checkpoints", type=int, default=3)
+    parser.add_argument("--keep-replay-files", type=int, default=DEFAULT_MAX_FILES)
+    parser.add_argument("--snapshot-every", type=int, default=25)
+    parser.add_argument("--min-free-gb", type=float, default=2.0)
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--no-tui", action="store_true")
     return parser.parse_args(argv)
@@ -253,8 +287,23 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("max_game_error_rate must be in [0, 1)")
     if args.time_limit_hours <= 0:
         raise ValueError("time_limit_hours must be positive")
+    if args.keep_checkpoints < 1:
+        raise ValueError("keep_checkpoints must be positive")
+    if args.keep_replay_files < 1:
+        raise ValueError("keep_replay_files must be positive")
+    if args.snapshot_every < 1:
+        raise ValueError("snapshot_every must be positive")
+    if args.min_free_gb < 0:
+        raise ValueError("min_free_gb cannot be negative")
     paths = RunPaths.from_value(args.output_dir)
     paths.ensure()
+    if not _storage_ready(
+        paths,
+        min_free_gb=args.min_free_gb,
+        keep_checkpoints=args.keep_checkpoints,
+        keep_replays=args.keep_replay_files,
+    ):
+        return 0
 
     # This must happen before a worker, model, or training allocation is created.
     tablebase, syzygy_path = require_syzygy()
@@ -288,6 +337,13 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         while iteration <= final_iteration:
+            if not _storage_ready(
+                paths,
+                min_free_gb=args.min_free_gb,
+                keep_checkpoints=args.keep_checkpoints,
+                keep_replays=args.keep_replay_files,
+            ):
+                return 0
             can_start, reason = budget.can_start_iteration(previous_iteration_seconds)
             if not can_start:
                 message = f"Graceful stop before iteration {iteration}: {reason}"
@@ -412,8 +468,23 @@ def run(args: argparse.Namespace) -> int:
                 atomic_torch_save(result.model.state_dict(), paths.latest_weights)
                 if promoted:
                     atomic_torch_save(result.model.state_dict(), paths.champion_weights)
+                if iteration % args.snapshot_every == 0:
+                    atomic_torch_save(
+                        result.model.state_dict(),
+                        paths.snapshot_path(iteration),
+                    )
                 atomic_jsonl_append(paths.metrics_path, metrics)
                 candidate_path.unlink(missing_ok=True)
+                removed = prune_run_artifacts(
+                    paths,
+                    keep_checkpoints=args.keep_checkpoints,
+                    keep_replays=args.keep_replay_files,
+                )
+                if removed["checkpoints"] or removed["replays"]:
+                    print(
+                        f"Retention: kept {args.keep_checkpoints} checkpoints and "
+                        f"{args.keep_replay_files} replay files."
+                    )
 
                 _print_iteration_metrics(metrics)
                 checkpoint = payload

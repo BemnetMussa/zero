@@ -22,7 +22,7 @@ There are three ways to build an AI: a dataset, an algorithm, and computation. H
 
 Same loop as [AlphaZero](https://arxiv.org/abs/1712.01815). A residual net looks at the board and guesses two things: which move looks good (**policy**), and who is winning (**value**). [MCTS](https://en.wikipedia.org/wiki/Monte_Carlo_tree_search) thinks with those guesses, then the net trains on the games.
 
-On a laptop that loop wastes nights if every game is the same comfortable draw. So v0.3 borrows from [KataGo](https://arxiv.org/abs/1902.10565) (search deep on some turns, throw away bad noise) and [LATE](https://doi.org/10.3233/FAIA230279) (care more about the end of a game), and now starts some games from a king and queen against a lone king, so it has to practice finishing.
+On a laptop that loop wastes nights if every game is the same comfortable draw. So v0.3 borrows from [KataGo](https://arxiv.org/abs/1902.10565) (search deep on some turns, throw away bad noise) and [LATE](https://doi.org/10.3233/FAIA230279) (care more about the end of a game). Its curriculum now starts from verified mate-in-1, mate-in-2, and cornered-king K+Q/K+R positions. Those short games use full noisy search but execute the most-visited move, producing decisive labels without teaching repetition loops.
 
 The Python package is still named `tabula`. That is the old name. Imports stay that way on purpose.
 
@@ -98,6 +98,10 @@ Useful flags:
 | `--mate-exam-every 50` | Re-test K+Q / K+R vs K every 50 loops |
 | `--output-dir PATH` | Store checkpoints, replay, and metrics under this directory |
 | `--time-limit-hours 7.5` | Stop cleanly before the next iteration would exceed the budget |
+| `--keep-checkpoints 3` | Keep only the newest full model/optimizer bundles |
+| `--keep-replay-files 10` | Keep only the active replay window |
+| `--snapshot-every 25` | Save lightweight model-only historical weights |
+| `--min-free-gb 2` | Prune or stop cleanly below this free-space floor |
 
 A thermal guard pauses the laptop if the GPU gets too hot.
 
@@ -105,16 +109,22 @@ Each completed iteration atomically writes:
 
 ```text
 checkpoints/
-  weights_iter_0001.pt
+  weights_iter_0023.pt
+  weights_iter_0024.pt
+  weights_iter_0025.pt
   latest_weights.pt
   champion_weights.pt
   metrics.jsonl
-  replay/replay_iter_0001.pt
+  replay/                 # newest 10 files only
+  snapshots/
+    model_iter_0025.pt
 ```
 
 The versioned checkpoint contains the model, optimizer, scheduler, iteration,
-and metadata. A timeout or failed iteration leaves the previous complete
-checkpoint untouched.
+and metadata. Only the newest three are retained. Model-only snapshots remain
+small enough for historical tracking. Startup and every iteration enforce a
+2 GiB free-space floor; a timeout, low disk, or failed iteration leaves the
+previous complete checkpoint untouched.
 
 ## Measure it
 

@@ -11,10 +11,12 @@ from tabula.runtime import (
     WallClockBudget,
     atomic_jsonl_append,
     atomic_torch_save,
+    check_disk_capacity,
     checkpoint_payload,
     latest_checkpoint,
     load_checkpoint,
     peak_cuda_memory_mib,
+    prune_run_artifacts,
 )
 
 
@@ -75,6 +77,56 @@ class RuntimePersistenceTests(unittest.TestCase):
             atomic_jsonl_append(path, {"iteration": 2})
             records = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual(records, [{"iteration": 1}, {"iteration": 2}])
+
+    def test_retention_keeps_three_checkpoints_and_active_replay_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = RunPaths.from_value(tmp)
+            paths.ensure()
+            for iteration in range(1, 7):
+                paths.checkpoint_path(iteration).write_bytes(b"checkpoint")
+            for iteration in range(1, 14):
+                paths.replay_path(iteration).write_bytes(b"replay")
+            paths.snapshot_path(1).write_bytes(b"history")
+
+            removed = prune_run_artifacts(
+                paths,
+                keep_checkpoints=3,
+                keep_replays=10,
+            )
+
+            self.assertEqual(
+                sorted(path.name for path in paths.root.glob("weights_iter_*.pt")),
+                [
+                    "weights_iter_0004.pt",
+                    "weights_iter_0005.pt",
+                    "weights_iter_0006.pt",
+                ],
+            )
+            self.assertEqual(len(list(paths.replay_dir.glob("replay_iter_*.pt"))), 10)
+            self.assertTrue(paths.snapshot_path(1).exists())
+            self.assertEqual(len(removed["checkpoints"]), 3)
+            self.assertEqual(len(removed["replays"]), 3)
+
+    def test_low_disk_check_prunes_then_reports_unsafe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = RunPaths.from_value(tmp)
+            paths.ensure()
+            for iteration in range(1, 6):
+                paths.checkpoint_path(iteration).write_bytes(b"x")
+            low_usage = mock.Mock(free=1024)
+            with mock.patch(
+                "tabula.runtime.shutil.disk_usage",
+                side_effect=[low_usage, low_usage],
+            ):
+                ok, free_bytes, removed = check_disk_capacity(
+                    paths,
+                    min_free_bytes=2 * 1024**3,
+                    keep_checkpoints=3,
+                    keep_replays=10,
+                )
+            self.assertFalse(ok)
+            self.assertEqual(free_bytes, 1024)
+            self.assertEqual(len(removed["checkpoints"]), 2)
 
 
 class RuntimeBudgetTests(unittest.TestCase):

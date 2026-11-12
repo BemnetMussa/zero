@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -46,15 +47,23 @@ class RunPaths:
     def champion_weights(self) -> Path:
         return self.root / "champion_weights.pt"
 
+    @property
+    def snapshot_dir(self) -> Path:
+        return self.root / "snapshots"
+
     def checkpoint_path(self, iteration: int) -> Path:
         return self.root / f"weights_iter_{iteration:04d}.pt"
 
     def replay_path(self, iteration: int) -> Path:
         return self.replay_dir / f"replay_iter_{iteration:04d}.pt"
 
+    def snapshot_path(self, iteration: int) -> Path:
+        return self.snapshot_dir / f"model_iter_{iteration:04d}.pt"
+
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.replay_dir.mkdir(parents=True, exist_ok=True)
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _temporary_path(path: Path) -> Path:
@@ -134,6 +143,79 @@ def checkpoint_payload(
 
 
 _CHECKPOINT_RE = re.compile(r"weights_iter_(\d{4,})\.pt$")
+_REPLAY_RE = re.compile(r"replay_iter_(\d{4,})\.pt$")
+
+
+def _prune_numbered_files(
+    directory: Path,
+    pattern: str,
+    name_re: re.Pattern[str],
+    keep: int,
+) -> list[Path]:
+    if keep < 1:
+        raise ValueError("artifact retention must keep at least one file")
+    numbered = []
+    for path in directory.glob(pattern):
+        match = name_re.fullmatch(path.name)
+        if match:
+            numbered.append((int(match.group(1)), path))
+    numbered.sort(reverse=True)
+    removed = []
+    for _, path in numbered[keep:]:
+        path.unlink(missing_ok=True)
+        removed.append(path)
+    if removed:
+        _fsync_directory(directory)
+    return removed
+
+
+def prune_run_artifacts(
+    paths: RunPaths,
+    *,
+    keep_checkpoints: int = 3,
+    keep_replays: int = 10,
+) -> dict[str, list[Path]]:
+    """Bound full checkpoints and replay files while preserving snapshots."""
+
+    paths.ensure()
+    return {
+        "checkpoints": _prune_numbered_files(
+            paths.root,
+            "weights_iter_*.pt",
+            _CHECKPOINT_RE,
+            keep_checkpoints,
+        ),
+        "replays": _prune_numbered_files(
+            paths.replay_dir,
+            "replay_iter_*.pt",
+            _REPLAY_RE,
+            keep_replays,
+        ),
+    }
+
+
+def check_disk_capacity(
+    paths: RunPaths,
+    *,
+    min_free_bytes: int = 2 * 1024**3,
+    keep_checkpoints: int = 3,
+    keep_replays: int = 10,
+) -> tuple[bool, int, dict[str, list[Path]]]:
+    """Prune bounded artifacts when space is low, then report if it is safe."""
+
+    if min_free_bytes < 0:
+        raise ValueError("min_free_bytes cannot be negative")
+    paths.ensure()
+    usage = shutil.disk_usage(paths.root)
+    removed = {"checkpoints": [], "replays": []}
+    if usage.free < min_free_bytes:
+        removed = prune_run_artifacts(
+            paths,
+            keep_checkpoints=keep_checkpoints,
+            keep_replays=keep_replays,
+        )
+        usage = shutil.disk_usage(paths.root)
+    return usage.free >= min_free_bytes, usage.free, removed
 
 
 def latest_checkpoint(paths: RunPaths) -> Path | None:

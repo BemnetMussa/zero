@@ -89,7 +89,7 @@ def tablebase_value(board, tablebase):
     if dtz is None:
         return None
     sign = 1.0 if wdl > 0 else -1.0
-    return sign * GAMMA ** abs(dtz)
+    return sign * GAMMA ** max(1, abs(dtz))
 
 
 def in_tablebase(board, tablebase) -> bool:

@@ -24,6 +24,8 @@ Same loop as [AlphaZero](https://arxiv.org/abs/1712.01815). A residual net looks
 
 On a laptop that loop wastes nights if every game is the same comfortable draw. So v0.3 borrows from [KataGo](https://arxiv.org/abs/1902.10565) (search deep on some turns, throw away bad noise) and [LATE](https://doi.org/10.3233/FAIA230279) (care more about the end of a game). Its curriculum now starts from verified mate-in-1, mate-in-2, and cornered-king K+Q/K+R positions. Those short games use full noisy search but execute the most-visited move, producing decisive labels without teaching repetition loops.
 
+Normal games sample from root visits with `τ=1` for the first 30 plies, including fast-search turns, then become greedy. Full-search roots mix Dirichlet noise (`α=0.3`, `ε=0.25`). Training adds a `0.01` entropy bonus to the policy objective. Once a normal game reaches a covered five-piece Syzygy position, the tables adjudicate it immediately.
+
 The Python package is still named `tabula`. That is the old name. Imports stay that way on purpose.
 
 ## Where it is

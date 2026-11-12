@@ -108,16 +108,13 @@ class SelfPlayWorker:
                     idx = self.action_encoder.encode(orient_move(move, flip))
                     pi[idx] = prob
 
-            # Root noise still diversifies the curriculum policy target, while
-            # greedy execution stops sampling from throwing away obvious mates.
-            selection = (
-                "sample"
-                if (
-                    practice_side is None
-                    and is_full
-                    and moves < sampling_moves
-                )
-                else "greedy"
+            # Normal self-play uses τ=1 visit sampling for every move in the
+            # opening window, including cheap fast-search turns. Curriculum
+            # games execute greedily so obvious mates are not sampled away.
+            selection = _selection_mode(
+                practice=practice_side is not None,
+                ply=moves,
+                sampling_moves=sampling_moves,
             )
             played = _choose_move(root_node, selection)
 
@@ -200,6 +197,13 @@ class SelfPlayWorker:
         
         # 6. Discounted z and a LATE × surprise weight for each full-search turn.
         return label_game(records, board, stop, practice_side is not None, self.tablebase)
+
+
+def _selection_mode(practice, ply, sampling_moves):
+    if not practice and ply < sampling_moves:
+        return "sample"
+    return "greedy"
+
 
 def _choose_move(root, selection):
     """Sample proportional to visits for the opening, then take the most visited move."""

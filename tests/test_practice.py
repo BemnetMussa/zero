@@ -14,7 +14,7 @@ from tabula.selfplay.practice import (
     MATE_IN_TWO_FENS,
     random_practice_board,
 )
-from tabula.selfplay.worker import SelfPlayWorker
+from tabula.selfplay.worker import SelfPlayWorker, _choose_move, _selection_mode
 
 
 def can_force_mate(board, attacker, plies):
@@ -32,6 +32,30 @@ def can_force_mate(board, attacker, plies):
 
 
 class PracticeBoardTests(unittest.TestCase):
+    def test_normal_games_sample_all_first_thirty_plies(self) -> None:
+        for ply in range(30):
+            self.assertEqual(_selection_mode(False, ply, 30), "sample")
+        self.assertEqual(_selection_mode(False, 30, 30), "greedy")
+        self.assertEqual(_selection_mode(True, 0, 30), "greedy")
+
+    def test_temperature_one_samples_proportional_to_visit_counts(self) -> None:
+        first = chess.Move.from_uci("e2e4")
+        second = chess.Move.from_uci("d2d4")
+        root = SimpleNamespace(
+            children={
+                first: SimpleNamespace(visit_count=2),
+                second: SimpleNamespace(visit_count=6),
+            }
+        )
+        with mock.patch(
+            "tabula.selfplay.worker.np.random.choice",
+            return_value=1,
+        ) as choice:
+            selected = _choose_move(root, "sample")
+        self.assertEqual(selected, second)
+        probabilities = choice.call_args.kwargs["p"]
+        self.assertEqual(probabilities.tolist(), [0.25, 0.75])
+
     def test_boards_are_legal_and_strong_side_moves(self) -> None:
         rng = random.Random(0)
         for _ in range(200):

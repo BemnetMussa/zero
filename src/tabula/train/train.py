@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from tabula.model.model import TabulaNet
@@ -22,6 +23,17 @@ DEFAULT_BATCH_SIZE = 48
 DEFAULT_EPOCHS = 10
 DEFAULT_LR = 0.001
 DEFAULT_WEIGHT_DECAY = 1e-4
+ENTROPY_BONUS = 0.01
+
+
+def policy_loss_with_entropy(policy_logits, targets, weights):
+    """Weighted soft-target cross-entropy minus a 0.01 entropy bonus."""
+
+    log_probs = F.log_softmax(policy_logits, dim=1)
+    probs = log_probs.exp()
+    cross_entropy = -(targets * log_probs).sum(dim=1)
+    entropy = -(probs * log_probs).sum(dim=1)
+    return ((cross_entropy - ENTROPY_BONUS * entropy) * weights).mean()
 
 
 class SelfPlayDataset(Dataset):
@@ -142,7 +154,6 @@ def train(
     
     # 3. Loss functions
     # Per-sample losses so LATE / surprise weights can scale each row.
-    policy_loss_fn = nn.CrossEntropyLoss(reduction="none")
     value_loss_fn = nn.MSELoss(reduction="none")
     
     # 4. Training Loop
@@ -171,9 +182,8 @@ def train(
             # Forward pass
             policy_logits, values = model(states)
             
-            loss_p_row = policy_loss_fn(policy_logits, pis)
             loss_v_row = value_loss_fn(values, zs).view(-1)
-            loss_p = (loss_p_row * weights).mean()
+            loss_p = policy_loss_with_entropy(policy_logits, pis, weights)
             loss_v = (loss_v_row * weights).mean()
             
             # Combine into joint loss

@@ -357,8 +357,8 @@ class TabulaTUI:
 
         lines.append(f" {BOLD}NEURAL NETWORK TRAINING LOSS TRAJECTORY{RESET}")
         lines.append(f"   Value Loss  : {FG_CYAN}{val_str}{RESET}  [{val_spark}]  (MSE on win/loss evaluation)")
-        lines.append(f"   Policy Loss : {FG_PURPLE}{pol_str}{RESET}  [{pol_spark}]  (Cross-entropy on move policy)")
-        lines.append(f"   Buffer Window: 25 recent files (~7,500 moves, sliding replay buffer)")
+        lines.append(f"   Policy Loss : {FG_PURPLE}{pol_str}{RESET}  [{pol_spark}]  (Cross-entropy − 0.01 entropy)")
+        lines.append(f"   Buffer Window: 10 recent files (bounded sliding replay buffer)")
         lines.append(f" {FG_MUTED}────────────────────────────────────────────────────────────────────────────{RESET}")
 
         # Section 4: DeepMind Generational Elo & Arena Gating (lines 17-21)

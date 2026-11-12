@@ -233,6 +233,27 @@ class SyzygyConfigurationTests(unittest.TestCase):
         failing.close.assert_called_once()
 
 
+class TablebaseValuePolicyTests(unittest.TestCase):
+    def test_decisive_wdl_uses_at_least_one_discount_step(self) -> None:
+        board = chess.Board("6k1/8/6K1/8/8/8/8/Q7 w - - 0 1")
+        for wdl, expected_sign in ((2, 1.0), (-2, -1.0)):
+            tablebase = mock.Mock()
+            tablebase.get_wdl.return_value = wdl
+            tablebase.get_dtz.return_value = 0
+            self.assertAlmostEqual(
+                tablebase_value(board, tablebase),
+                expected_sign * GAMMA,
+            )
+
+    def test_cursed_wins_and_blessed_losses_are_draws(self) -> None:
+        board = chess.Board("6k1/8/6K1/8/8/8/8/Q7 w - - 0 1")
+        for wdl in (-1, 0, 1):
+            tablebase = mock.Mock()
+            tablebase.get_wdl.return_value = wdl
+            self.assertEqual(tablebase_value(board, tablebase), 0.0)
+            tablebase.get_dtz.assert_not_called()
+
+
 @unittest.skipIf(TABLEBASE is None, "no Syzygy tables (syzygy/345 or $SYZYGY_PATH)")
 class TablebaseTests(unittest.TestCase):
     def test_practice_mate_uses_dtz(self) -> None:

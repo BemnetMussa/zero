@@ -34,14 +34,6 @@ class FakeState:
         return self._state
 
 
-class FakeTablebase:
-    def __init__(self):
-        self.closed = False
-
-    def close(self):
-        self.closed = True
-
-
 class SelfPlayResilienceTests(unittest.TestCase):
     def test_one_transient_error_continues_within_budget(self) -> None:
         FakeWorker.outcomes = [
@@ -122,7 +114,7 @@ class PipelineArtifactTests(unittest.TestCase):
         args = pipeline.parse_args(["--simulations", "30"])
         self.assertEqual(args.simulations, 30)
 
-    def test_low_disk_startup_exits_cleanly_before_syzygy_or_workers(self) -> None:
+    def test_low_disk_startup_exits_cleanly_before_workers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args = pipeline.parse_args(
                 ["--no-tui", "--output-dir", tmp, "--iterations", "1"]
@@ -133,10 +125,13 @@ class PipelineArtifactTests(unittest.TestCase):
                     "check_disk_capacity",
                     return_value=(False, 1024, {"checkpoints": [], "replays": []}),
                 ),
-                mock.patch.object(pipeline, "require_syzygy") as require_syzygy,
+                mock.patch.object(pipeline, "SelfPlayWorker") as worker_cls,
             ):
                 self.assertEqual(pipeline.run(args), 0)
-            require_syzygy.assert_not_called()
+            worker_cls.assert_not_called()
+
+    def test_training_starts_without_any_tablebase_configured(self) -> None:
+        self.assertFalse(hasattr(pipeline, "require_syzygy"))
 
     def test_resume_rebuilds_raw_weights_from_canonical_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,6 +149,72 @@ class PipelineArtifactTests(unittest.TestCase):
             torch.testing.assert_close(latest["weight"], torch.tensor([2.0]))
             torch.testing.assert_close(champion["weight"], torch.tensor([2.0]))
 
+    def test_seeded_resume_continues_at_970_without_touching_run1(self) -> None:
+        result = TrainResult(
+            model=FakeState({"weight": torch.tensor([3.0])}),
+            optimizer=FakeState({"step": 970}),
+            scheduler=FakeState({"cycle": 2}),
+            policy_loss=0.5,
+            value_loss=0.1,
+            total_loss=0.6,
+            learning_rate=0.0005,
+            examples=2,
+        )
+        FakeWorker.outcomes = [([("state", "pi", "z", "weight")], "CHECKMATE")]
+        with tempfile.TemporaryDirectory() as tmp:
+            run1 = RunPaths.from_value(Path(tmp) / "run1")
+            run1.ensure()
+            run1_replay = run1.replay_path(969)
+            torch.save([("old",)], run1_replay)
+            torch.save(
+                {
+                    "format_version": 1,
+                    "iteration": 969,
+                    "model_state": {"weight": torch.tensor([2.0])},
+                    "optimizer_state": {"step": 969},
+                    "scheduler_state": {"cycle": 1},
+                    "metadata": {"metrics": {"promoted": True}},
+                },
+                run1.checkpoint_path(969),
+            )
+            run1_bytes = run1.checkpoint_path(969).read_bytes()
+            run2 = RunPaths.from_value(Path(tmp) / "run2")
+            args = pipeline.parse_args(
+                [
+                    "--no-tui",
+                    "--output-dir",
+                    str(run2.root),
+                    "--resume-from",
+                    str(run1.checkpoint_path(969)),
+                    "--iterations",
+                    "1",
+                    "--games",
+                    "1",
+                    "--mate-exam-every",
+                    "0",
+                    "--time-limit-hours",
+                    "1",
+                ]
+            )
+            with (
+                mock.patch.object(pipeline, "SelfPlayWorker", FakeWorker),
+                mock.patch.object(pipeline, "train", return_value=result) as train_mock,
+                mock.patch.object(pipeline.torch.cuda, "is_available", return_value=False),
+                mock.patch.object(pipeline, "ThermalGuard"),
+            ):
+                self.assertEqual(pipeline.run(args), 0)
+
+            seed = train_mock.call_args.kwargs["checkpoint"]
+            self.assertEqual(seed["iteration"], 969)
+            self.assertEqual(seed["optimizer_state"]["step"], 969)
+            self.assertEqual(seed["scheduler_state"]["cycle"], 1)
+            resumed = load_checkpoint(run2.checkpoint_path(970))
+            self.assertEqual(resumed["iteration"], 970)
+            self.assertAlmostEqual(resumed["metadata"]["repetition_penalty"], -0.20)
+            self.assertEqual(run1.checkpoint_path(969).read_bytes(), run1_bytes)
+            self.assertTrue(run1_replay.exists())
+            self.assertFalse(any(run1.root.glob("weights_iter_0970.pt")))
+
     def test_one_iteration_writes_all_durable_artifacts(self) -> None:
         model = FakeState({"weight": torch.tensor([1.0])})
         optimizer = FakeState({"step": 1})
@@ -168,7 +229,6 @@ class PipelineArtifactTests(unittest.TestCase):
             learning_rate=0.001,
             examples=1,
         )
-        tablebase = FakeTablebase()
         FakeWorker.outcomes = [([("state", "pi", "z", "weight")], "CHECKMATE")]
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,7 +252,6 @@ class PipelineArtifactTests(unittest.TestCase):
                 ]
             )
             with (
-                mock.patch.object(pipeline, "require_syzygy", return_value=(tablebase, Path("/tables"))),
                 mock.patch.object(pipeline, "SelfPlayWorker", FakeWorker),
                 mock.patch.object(pipeline, "train", return_value=result),
                 mock.patch.object(pipeline.torch.cuda, "is_available", return_value=False),
@@ -216,7 +275,6 @@ class PipelineArtifactTests(unittest.TestCase):
             snapshot = torch.load(paths.snapshot_path(1), weights_only=True)
             self.assertEqual(set(snapshot), {"weight"})
             self.assertFalse(any(paths.root.glob(".candidate*")))
-            self.assertTrue(tablebase.closed)
 
 
 if __name__ == "__main__":

@@ -3,21 +3,44 @@ import numpy as np
 import torch
 import chess
 
+from tabula.selfplay.labels import REPETITION_TERMINATIONS, white_repetition_value
+
 FORCED_PLAYOUT_K = 2.0
+
+
+def _side_to_move(white_value, board):
+    return white_value if board.turn == chess.WHITE else -white_value
 
 
 def terminal_value(board):
     """Value for the side to move, or None if the game is still going.
 
-    Every draw the rules produce is 0. Checkmate is -1 for the side that
-    has to move. No material values or repetition contempt enter search.
+    Checkmate is ±1. Stalemate, insufficient material, and the 50-move rule
+    are 0. Repetition charges the repetition penalty to the offending side.
     """
     outcome = board.outcome(claim_draw=True)
     if outcome is None:
         return None
-    if outcome.winner is None:
-        return 0.0
-    return 1.0 if outcome.winner == board.turn else -1.0
+    if outcome.winner is not None:
+        return 1.0 if outcome.winner == board.turn else -1.0
+    if outcome.termination.name in REPETITION_TERMINATIONS:
+        return _side_to_move(white_repetition_value(board), board)
+    return 0.0
+
+
+def tree_leaf_value(board, at_root=False):
+    """Terminal value inside the search tree, with twofold pruning.
+
+    Below the root, returning to any earlier position (game history or the
+    current search path) ends the line with the repetition penalty charged to
+    the side that initiated the loop, so search stops spending visits on it.
+    """
+    value = terminal_value(board)
+    if value is not None or at_root:
+        return value
+    if board.move_stack and board.is_repetition(2):
+        return _side_to_move(white_repetition_value(board, reached=2), board)
+    return None
 
 
 def forced_visit_floor(prior_prob, parent_visits, k=FORCED_PLAYOUT_K) -> float:
@@ -112,7 +135,7 @@ class MCTS:
             # 2. EXPAND & EVALUATE
             # claim_draw matches the game loop. Without it, a threefold repetition
             # is not over inside the tree, so the search walks into the draw.
-            value = terminal_value(search_board)
+            value = tree_leaf_value(search_board, at_root=node is root)
             if value is None:
                 # Leaf node reached - Ask TabulaNet for P (Policy) and V (Value)
                 policy_dict, value = self.predict(search_board, encoder)

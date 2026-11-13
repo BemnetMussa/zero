@@ -127,7 +127,6 @@ class PracticeBoardTests(unittest.TestCase):
         worker = object.__new__(SelfPlayWorker)
         worker.mcts = FakeMCTS()
         worker.action_encoder = ActionEncoder()
-        worker.tablebase = None
         with mock.patch.object(
             worker_module,
             "random_practice_board",

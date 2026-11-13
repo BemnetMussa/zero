@@ -17,6 +17,7 @@ from tabula.runtime import (
     load_checkpoint,
     peak_cuda_memory_mib,
     prune_run_artifacts,
+    resolve_resume_checkpoint,
 )
 
 
@@ -127,6 +128,64 @@ class RuntimePersistenceTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(free_bytes, 1024)
             self.assertEqual(len(removed["checkpoints"]), 2)
+
+
+class ResumeResolutionTests(unittest.TestCase):
+    def test_resolve_resume_from_checkpoint_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = RunPaths.from_value(tmp)
+            paths.ensure()
+            checkpoint = paths.checkpoint_path(969)
+            payload = checkpoint_payload(
+                iteration=969,
+                model_state={"w": torch.tensor([1.0])},
+                optimizer_state={"step": 969},
+                scheduler_state={"cycle": 1},
+                metadata={"tag": "run1"},
+            )
+            atomic_torch_save(payload, checkpoint)
+            selected = resolve_resume_checkpoint(paths, resume_from=checkpoint)
+            self.assertEqual(selected, checkpoint)
+            loaded = load_checkpoint(selected)
+            self.assertEqual(loaded["iteration"], 969)
+            self.assertEqual(loaded["optimizer_state"]["step"], 969)
+
+    def test_resolve_resume_from_directory_picks_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = RunPaths.from_value(Path(tmp) / "run1")
+            source.ensure()
+            atomic_torch_save({"iteration": 100}, source.checkpoint_path(100))
+            atomic_torch_save({"iteration": 969}, source.checkpoint_path(969))
+            output = RunPaths.from_value(Path(tmp) / "run2")
+            output.ensure()
+            selected = resolve_resume_checkpoint(output, resume_from=source.root)
+            self.assertEqual(selected, source.checkpoint_path(969))
+
+    def test_output_dir_progress_wins_over_seed_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = RunPaths.from_value(Path(tmp) / "run1")
+            seed.ensure()
+            atomic_torch_save({"iteration": 969}, seed.checkpoint_path(969))
+            output = RunPaths.from_value(Path(tmp) / "run2")
+            output.ensure()
+            atomic_torch_save({"iteration": 985}, output.checkpoint_path(985))
+            selected = resolve_resume_checkpoint(output, resume_from=seed.checkpoint_path(969))
+            self.assertEqual(selected, output.checkpoint_path(985))
+
+    def test_missing_seed_fails_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = RunPaths.from_value(tmp)
+            paths.ensure()
+            with self.assertRaisesRegex(RuntimeError, "does not exist"):
+                resolve_resume_checkpoint(paths, resume_from=Path(tmp) / "nope.pt")
+
+    def test_no_resume_rejects_existing_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = RunPaths.from_value(tmp)
+            paths.ensure()
+            paths.checkpoint_path(1).write_bytes(b"x")
+            with self.assertRaisesRegex(RuntimeError, "--no-resume"):
+                resolve_resume_checkpoint(paths, no_resume=True)
 
 
 class RuntimeBudgetTests(unittest.TestCase):

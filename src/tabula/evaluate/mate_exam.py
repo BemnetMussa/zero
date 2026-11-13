@@ -5,6 +5,9 @@ search's most-visited move with no noise. Self-play mate counts are noisy;
 this is the before/after ruler for practice games.
 
 Run: PYTHONPATH=src python -m tabula.evaluate.mate_exam --model models/tabula_v0.2_latest.pth
+
+Offline only: pass --syzygy PATH to report each board's perfect-play DTZ next
+to the plies the model needed. The tables never influence the moves played.
 """
 
 import argparse
@@ -17,6 +20,7 @@ import chess
 
 from tabula.evaluate.benchmark import DEFAULT_MODEL, load_model
 from tabula.game.encoder import encode_board
+from tabula.evaluate.oracle import open_syzygy, optimal_dtz
 from tabula.mcts.search import MCTS
 from tabula.selfplay.practice import random_practice_board
 from tabula.selfplay.worker import DEFAULT_RES_BLOCKS
@@ -46,7 +50,14 @@ def play_out(mcts, board):
     return outcome.winner is not None, plies, outcome.termination.name
 
 
-def run_mate_exam(model_path, num_simulations=80, num_res_blocks=DEFAULT_RES_BLOCKS, out_path=None, model=None):
+def run_mate_exam(
+    model_path,
+    num_simulations=80,
+    num_res_blocks=DEFAULT_RES_BLOCKS,
+    out_path=None,
+    model=None,
+    tablebase=None,
+):
     model = model if model is not None else load_model(model_path, num_res_blocks)
     mcts = MCTS(model, num_simulations=num_simulations, c_puct=1.25)
 
@@ -56,7 +67,7 @@ def run_mate_exam(model_path, num_simulations=80, num_res_blocks=DEFAULT_RES_BLO
         piece = "Q" if board.pieces(chess.QUEEN, strong) else "R"
         _, start_value = mcts.predict(board, encode_board)
         mated, plies, termination = play_out(mcts, board)
-        results.append({
+        row = {
             "idx": idx,
             "fen": board.fen(),
             "piece": piece,
@@ -64,9 +75,14 @@ def run_mate_exam(model_path, num_simulations=80, num_res_blocks=DEFAULT_RES_BLO
             "mated": mated,
             "plies": plies,
             "termination": termination,
-        })
+        }
+        perfect = ""
+        if tablebase is not None:
+            row["optimal_dtz"] = optimal_dtz(board, tablebase)
+            perfect = f" | perfect DTZ={row['optimal_dtz']}"
+        results.append(row)
         print(f"[{idx:02d}/{EXAM_BOARDS}] K+{piece} vs K | V={start_value:+.2f} | "
-              f"{'MATE' if mated else 'no mate'} after {plies} plies ({termination})")
+              f"{'MATE' if mated else 'no mate'} after {plies} plies ({termination}){perfect}")
 
     mates = [r for r in results if r["mated"]]
     summary = {
@@ -83,6 +99,9 @@ def run_mate_exam(model_path, num_simulations=80, num_res_blocks=DEFAULT_RES_BLO
         "elapsed_sec": round(time.time() - t_start, 1),
         "results": results,
     }
+    if tablebase is not None:
+        optimal = [r["optimal_dtz"] for r in mates if r.get("optimal_dtz") is not None]
+        summary["avg_optimal_dtz_mated"] = round(sum(optimal) / len(optimal), 1) if optimal else None
 
     print("\n=== Zero mate exam ===")
     print(f"Mates: {summary['mates']}/{summary['n']} "
@@ -104,8 +123,20 @@ def main():
     parser.add_argument("--sims", type=int, default=80)
     parser.add_argument("--res-blocks", type=int, default=DEFAULT_RES_BLOCKS)
     parser.add_argument("--out", default="data/mate_exam.json")
+    parser.add_argument("--syzygy", default=None, help="Offline only: Syzygy dir for perfect-play DTZ")
     args = parser.parse_args()
-    run_mate_exam(args.model, args.sims, args.res_blocks, args.out)
+    status = open_syzygy(args.syzygy) if args.syzygy else None
+    try:
+        run_mate_exam(
+            args.model,
+            args.sims,
+            args.res_blocks,
+            args.out,
+            tablebase=status.tablebase if status else None,
+        )
+    finally:
+        if status is not None:
+            status.tablebase.close()
 
 
 if __name__ == "__main__":

@@ -55,8 +55,8 @@ def _randomize_board(board, rng):
 def random_practice_board(rng=random):
     """Sample a symmetric mate-in-1, mate-in-2, or cornered-king setup.
 
-    The strong side always moves. Syzygy DTZ for these pawnless positions is
-    one or three plies, so successful labels begin near +0.99 or +0.97.
+    The strong side always moves. A fast mate from these boards takes one or
+    three plies, so successful labels begin near +0.99 or +0.97.
     """
     board = chess.Board(rng.choice(_curriculum_group(rng)))
     board = _randomize_board(board, rng)

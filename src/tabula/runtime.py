@@ -17,8 +17,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-import chess
-import chess.syzygy
 import torch
 
 
@@ -244,50 +242,39 @@ def load_checkpoint(path: str | os.PathLike[str], *, map_location="cpu") -> dict
     return payload
 
 
-KQK_PROBE = "6k1/8/6K1/8/8/8/8/Q7 w - - 0 1"
-KRK_PROBE = "k7/8/1K6/8/8/8/8/2R5 w - - 0 1"
+def resolve_resume_checkpoint(
+    paths: RunPaths,
+    *,
+    resume_from: str | os.PathLike[str] | None = None,
+    no_resume: bool = False,
+) -> Path | None:
+    """Pick the checkpoint to continue from, or None for a fresh run.
 
-
-def probe_syzygy(tablebase) -> dict:
-    results = {}
-    for name, fen in (("KQK", KQK_PROBE), ("KRK", KRK_PROBE)):
-        board = chess.Board(fen)
-        try:
-            wdl = tablebase.probe_wdl(board)
-            dtz = tablebase.probe_dtz(board)
-        except Exception as exc:
-            raise RuntimeError(f"Syzygy {name} probe failed: {exc}") from exc
-        if wdl != 2 or dtz != 1:
+    Checkpoints already in the output directory win over --resume-from, so a
+    restarted session continues its own progress instead of rewinding to the
+    seed checkpoint.
+    """
+    local = latest_checkpoint(paths)
+    if no_resume:
+        if local is not None:
             raise RuntimeError(
-                f"Syzygy {name} probe returned WDL={wdl}, DTZ={dtz}; expected 2, 1"
+                "--no-resume cannot reuse an output directory containing checkpoints; "
+                "choose a new --output-dir"
             )
-        results[name] = {"wdl": wdl, "dtz": dtz}
-    return results
-
-
-def require_syzygy(path_value: str | None = None):
-    configured = path_value if path_value is not None else os.environ.get("SYZYGY_PATH")
-    if not configured:
-        raise RuntimeError("SYZYGY_PATH is required before training")
-    path = Path(configured).expanduser().resolve()
-    if not path.exists():
-        raise RuntimeError(f"SYZYGY_PATH does not exist: {path}")
-    if not path.is_dir():
-        raise RuntimeError(f"SYZYGY_PATH is not a directory: {path}")
-    if not any(path.glob("*.rtbw")) or not any(path.glob("*.rtbz")):
-        raise RuntimeError(f"SYZYGY_PATH has no complete WDL/DTZ tables: {path}")
-    try:
-        tablebase = chess.syzygy.open_tablebase(str(path))
-    except Exception as exc:
-        raise RuntimeError(f"Could not open Syzygy tables at {path}: {exc}") from exc
-    try:
-        probe_syzygy(tablebase)
-    except Exception as exc:
-        tablebase.close()
-        raise RuntimeError(
-            f"Syzygy mandatory KQK/KRK probe failed at {path}: {exc}"
-        ) from exc
-    return tablebase, path
+        return None
+    if local is not None:
+        return local
+    if resume_from:
+        candidate = Path(resume_from).expanduser().resolve()
+        if candidate.is_dir():
+            selected = latest_checkpoint(RunPaths.from_value(candidate))
+            if selected is None:
+                raise RuntimeError(f"--resume-from directory has no checkpoints: {candidate}")
+            return selected
+        if candidate.is_file():
+            return candidate
+        raise RuntimeError(f"--resume-from path does not exist: {candidate}")
+    return None
 
 
 @dataclass

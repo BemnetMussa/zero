@@ -8,7 +8,7 @@ from tabula.model.model import TabulaNet
 from tabula.mcts.search import MCTS
 from tabula.game.encoder import encode_board, needs_orient, orient_move
 from tabula.game.action_encoder import ActionEncoder
-from tabula.selfplay.labels import MAX_PLIES, Record, game_result, in_tablebase, label_game, open_tablebase
+from tabula.selfplay.labels import MAX_PLIES, Record, game_result, label_game
 from tabula.selfplay.practice import random_practice_board
 
 # v0.2 defaults (AlphaZero used 800; laptop budget stays far below that).
@@ -19,7 +19,7 @@ FAST_SIMULATIONS = 16
 FULL_SEARCH_P = 0.25
 
 class SelfPlayWorker:
-    def __init__(self, model_path=None, num_simulations=DEFAULT_SIMULATIONS, num_res_blocks=DEFAULT_RES_BLOCKS, tablebase=None):
+    def __init__(self, model_path=None, num_simulations=DEFAULT_SIMULATIONS, num_res_blocks=DEFAULT_RES_BLOCKS):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Initializing TabulaNet for Self-Play on {self.device} ({num_res_blocks} ResBlocks, {num_simulations} sims)...")
         self.model = TabulaNet(num_res_blocks=num_res_blocks).to(self.device)
@@ -30,8 +30,6 @@ class SelfPlayWorker:
         
         self.mcts = MCTS(self.model, num_simulations=num_simulations, c_puct=1.25)
         self.action_encoder = ActionEncoder()
-        self.tablebase = tablebase if tablebase is not None else open_tablebase()
-        print(f"Syzygy tablebase: {'loaded' if self.tablebase else 'not found (labels from game results only)'}")
 
     def play_game(self, render=False, delay=0.5, live=None, hold=0.0, sampling_moves=30, practice=False):
         """Plays a single game of Zero vs Zero and returns the training examples.
@@ -41,8 +39,8 @@ class SelfPlayWorker:
         fast quiet search (n sims, no noise) just to move the game forward.
 
         practice=True starts from a K+Q or K+R vs K board instead of the normal
-        start. Only mate counts as finishing there; anything else is dropped.
-        A normal game stops when it enters the tablebase or hits MAX_PLIES.
+        start. Mate and repetition are kept there; anything else is dropped.
+        Every game plays out under the bare rules or stops at MAX_PLIES.
         """
         if practice:
             board, practice_side = random_practice_board()
@@ -151,18 +149,13 @@ class SelfPlayWorker:
             if not render and moves % 10 == 0:
                 print(f"Move {moves}... (Eval: {root_node.q_value:.2f})")
 
-            # Practice boards start inside the tables, so only normal games stop here.
-            if practice_side is None and board.outcome(claim_draw=True) is None and in_tablebase(board, self.tablebase):
-                stop = "TABLEBASE"
-                break
-
             if moves >= MAX_PLIES:
                 stop = "MOVE_LIMIT"
                 print(f"Hit the {MAX_PLIES}-ply cap.")
                 break
 
         # 5. Game over: result for the log and the live view.
-        reward, result, termination = game_result(board, stop, practice_side is not None, self.tablebase)
+        reward, result, termination = game_result(board, stop, practice_side is not None)
         self.last_termination = termination
         self.last_root_noise_calls = root_noise_calls
 
@@ -196,7 +189,7 @@ class SelfPlayWorker:
                 time.sleep(max(hold, 1.0))
         
         # 6. Discounted z and a LATE × surprise weight for each full-search turn.
-        return label_game(records, board, stop, practice_side is not None, self.tablebase)
+        return label_game(records, board, stop, practice_side is not None)
 
 
 def _selection_mode(practice, ply, sampling_moves):

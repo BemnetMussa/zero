@@ -64,7 +64,6 @@ def _finished_game(result, termination, moves):
     }
     why = {
         "MOVE_LIMIT": "Hit the 200-ply safety rail, so the game is a draw.",
-        "TABLEBASE": "Five pieces or fewer: the Syzygy tables decided the result.",
         "THREEFOLD_REPETITION": "The position repeated.",
         "FIVEFOLD_REPETITION": "The position repeated.",
         "FIFTY_MOVES": "Fifty moves without a capture or a pawn move.",

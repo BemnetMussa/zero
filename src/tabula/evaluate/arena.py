@@ -6,7 +6,7 @@ from tabula.model.model import TabulaNet
 from tabula.mcts.search import MCTS
 from tabula.game.encoder import encode_board
 from tabula.runtime import atomic_torch_save
-from tabula.selfplay.labels import MAX_PLIES, game_result, in_tablebase, open_tablebase
+from tabula.selfplay.labels import MAX_PLIES, game_result
 
 DEFAULT_RES_BLOCKS = 8
 
@@ -32,7 +32,6 @@ class Arena:
         challenger_path,
         num_simulations=100,
         num_res_blocks=DEFAULT_RES_BLOCKS,
-        tablebase=None,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Arena running on: {self.device} ({num_res_blocks} ResBlocks, {num_simulations} sims)")
@@ -56,7 +55,6 @@ class Arena:
         # 3. Setup MCTS for both
         self.champ_mcts = MCTS(self.champion, num_simulations=num_simulations)
         self.chall_mcts = MCTS(self.challenger, num_simulations=num_simulations)
-        self.tablebase = tablebase if tablebase is not None else open_tablebase()
         
         self.champion_path = champion_path
 
@@ -113,20 +111,14 @@ class Arena:
             last_move = best_move
             moves += 1
 
-            if board.outcome(claim_draw=True) is None and in_tablebase(board, self.tablebase):
-                stop = "TABLEBASE"
-                break
-
             # Algorithmic safety rail, not a chess rule. A game that reaches it
             # is a draw; no material score is allowed in the arena gate.
             if moves >= MAX_PLIES:
                 stop = "MOVE_LIMIT"
                 break
 
-        # Arena and self-play use the same rule/tablebase result semantics.
-        white_reward, result, termination = game_result(
-            board, stop, practice=False, tablebase=self.tablebase
-        )
+        # Arena and self-play use the same rule-based result semantics.
+        white_reward, result, termination = game_result(board, stop, practice=False)
         self.last_result = f"{result} ({termination}) white {white_reward:+.2f}"
         if live is not None:
             winner = "WHITE" if white_reward > 0.05 else ("BLACK" if white_reward < -0.05 else "DRAW")

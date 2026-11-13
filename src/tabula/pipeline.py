@@ -24,14 +24,14 @@ from tabula.runtime import (
     atomic_torch_save,
     check_disk_capacity,
     checkpoint_payload,
-    latest_checkpoint,
     load_checkpoint,
     peak_cuda_memory_mib,
     prune_run_artifacts,
-    require_syzygy,
+    resolve_resume_checkpoint,
     utc_now,
 )
 from tabula.hardware.thermal import ThermalGuard
+from tabula.selfplay.labels import repetition_penalty
 from tabula.selfplay.worker import DEFAULT_RES_BLOCKS, DEFAULT_SIMULATIONS, SelfPlayWorker
 from tabula.train.train import DEFAULT_EPOCHS, DEFAULT_MAX_FILES, TrainResult, train
 from tabula.watch.live import LiveBoard
@@ -269,6 +269,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--keep-replay-files", type=int, default=DEFAULT_MAX_FILES)
     parser.add_argument("--snapshot-every", type=int, default=25)
     parser.add_argument("--min-free-gb", type=float, default=2.0)
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="Checkpoint file or run directory to resume (defaults to newest in --output-dir)",
+    )
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--no-tui", action="store_true")
     return parser.parse_args(argv)
@@ -313,16 +318,12 @@ def run(args: argparse.Namespace) -> int:
     ):
         return 0
 
-    # This must happen before a worker, model, or training allocation is created.
-    tablebase, syzygy_path = require_syzygy()
-
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    checkpoint_path = None if args.no_resume else latest_checkpoint(paths)
-    if args.no_resume and latest_checkpoint(paths) is not None:
-        raise RuntimeError(
-            "--no-resume cannot reuse an output directory containing checkpoints; "
-            "choose a new --output-dir"
-        )
+    checkpoint_path = resolve_resume_checkpoint(
+        paths,
+        resume_from=args.resume_from,
+        no_resume=args.no_resume,
+    )
     checkpoint = (
         load_checkpoint(checkpoint_path, map_location=device)
         if checkpoint_path is not None
@@ -338,10 +339,14 @@ def run(args: argparse.Namespace) -> int:
     live = None if args.no_tui else LiveBoard()
 
     print(f"Device: {device}")
-    print(f"Syzygy: {syzygy_path}")
     print(f"Output: {paths.root}")
+    print(f"MCTS simulations: {args.simulations}")
+    print(f"Repetition penalty: {repetition_penalty():+.2f}")
     if checkpoint_path is not None:
-        print(f"Resuming from {checkpoint_path.name} at iteration {iteration}")
+        print(
+            f"Resuming from {checkpoint_path} at iteration {iteration} "
+            f"(loaded model/optimizer/scheduler; replay dir preserved)"
+        )
 
     try:
         while iteration <= final_iteration:
@@ -377,7 +382,6 @@ def run(args: argparse.Namespace) -> int:
                     model_path=model_path,
                     num_simulations=args.simulations,
                     num_res_blocks=DEFAULT_RES_BLOCKS,
-                    tablebase=tablebase,
                 )
                 replay, stats = run_selfplay_phase(
                     worker,
@@ -420,7 +424,6 @@ def run(args: argparse.Namespace) -> int:
                     arena = Arena(
                         champion_path=paths.champion_weights,
                         challenger_path=candidate_path,
-                        tablebase=tablebase,
                     )
                     promoted = arena.evaluate(
                         num_games=args.arena_games,
@@ -466,7 +469,7 @@ def run(args: argparse.Namespace) -> int:
                         "metrics": metrics,
                         "config": vars(args),
                         "selfplay": asdict(stats),
-                        "syzygy_path": str(syzygy_path),
+                        "repetition_penalty": repetition_penalty(),
                     },
                 )
 
@@ -520,7 +523,6 @@ def run(args: argparse.Namespace) -> int:
         print("Stopped by user; the last complete checkpoint remains intact.")
         return 0
     finally:
-        tablebase.close()
         if live is not None and live.tui is not None:
             live.tui.close()
 

@@ -15,16 +15,17 @@ import chess
 import numpy as np
 import torch
 
+from tabula import pipeline, runtime
 from tabula.game.encoder import encode_board
-from tabula import runtime
 from tabula.evaluate import arena
 from tabula.mcts import search
-from tabula.mcts.search import terminal_value
-from tabula.selfplay import labels, worker
-from tabula.selfplay.labels import GAMMA, Record, game_result, label_game, open_tablebase, tablebase_value
+from tabula.mcts.search import terminal_value, tree_leaf_value
+from tabula.selfplay import labels, practice, worker
+from tabula.selfplay.labels import GAMMA, Record, game_result, label_game
+from tabula.train import train
 from tabula.train.train import SelfPlayDataset
 
-TABLEBASE = open_tablebase()
+PENALTY = labels.DEFAULT_REPETITION_PENALTY
 
 
 def play(fen, ucis):
@@ -55,6 +56,7 @@ KNIGHT_SHUFFLE = [
     "g1f3", "g8f6", "f3g1", "f6g8",
     "g1f3", "g8f6", "f3g1", "f6g8",
 ]
+# White (the strong side) starts the cycle: Qb2, Kg8, Qb1, Kh8, twice.
 KQK_SHUFFLE = ("7k/8/8/8/8/8/8/KQ6 w - - 0 1", ["b1b2", "h8g8", "b2b1", "g8h8"] * 2)
 
 
@@ -72,15 +74,78 @@ class QuickMateTests(unittest.TestCase):
         self.assertGreater(zs(data)[2], zs(data)[0])
 
 
-class DrawTests(unittest.TestCase):
-    def test_threefold_shuffle_is_zero_and_kept(self) -> None:
+class RepetitionPenaltyTests(unittest.TestCase):
+    def test_threefold_charges_the_side_that_initiated_the_loop(self) -> None:
         board, records = play(chess.STARTING_FEN, KNIGHT_SHUFFLE)
-        outcome = board.outcome(claim_draw=True)
-        self.assertEqual(outcome.termination, chess.Termination.THREEFOLD_REPETITION)
+        self.assertEqual(
+            board.outcome(claim_draw=True).termination,
+            chess.Termination.THREEFOLD_REPETITION,
+        )
+        # The start position repeats with White to move: White initiated.
+        white, _, term = game_result(board, None, practice=False)
+        self.assertEqual(term, "THREEFOLD_REPETITION")
+        self.assertAlmostEqual(white, PENALTY)
         data = label_game(records, board, stop=None, practice=False)
         self.assertEqual(len(data), len(records))
-        self.assertTrue(all(z == 0.0 for z in zs(data)))
+        # Last record: Black to move, one ply before the end.
+        self.assertAlmostEqual(zs(data)[-1], -PENALTY * GAMMA, places=6)
+        self.assertAlmostEqual(zs(data)[0], PENALTY * GAMMA ** 8, places=6)
 
+    def test_claim_by_move_charges_the_side_to_move_in_the_repeated_position(self) -> None:
+        # After 7 plies Black could claim with Kh8, which recreates the start
+        # position with White to move. White started the cycle and pays.
+        board, _ = play(KQK_SHUFFLE[0], KQK_SHUFFLE[1][:7])
+        self.assertFalse(board.is_repetition(3))
+        self.assertEqual(
+            board.outcome(claim_draw=True).termination,
+            chess.Termination.THREEFOLD_REPETITION,
+        )
+        self.assertEqual(labels.repetition_offender(board), chess.WHITE)
+        self.assertAlmostEqual(game_result(board, None, practice=True)[0], PENALTY)
+
+    def test_strong_side_shuffle_is_penalised_not_rewarded(self) -> None:
+        board, records = play(*KQK_SHUFFLE)
+        data = label_game(records, board, stop=None, practice=True)
+        self.assertEqual(len(data), len(records))
+        white_rows = [z for rec, z in zip(records, zs(data)) if rec.turn == chess.WHITE]
+        self.assertTrue(all(z < 0.0 for z in white_rows))
+
+    def test_penalty_is_configurable(self) -> None:
+        board, _ = play(chess.STARTING_FEN, KNIGHT_SHUFFLE)
+        with mock.patch.dict(os.environ, {"TABULA_REPETITION_PENALTY": "-0.5"}):
+            self.assertAlmostEqual(game_result(board, None, practice=False)[0], -0.5)
+
+    def test_search_terminal_uses_penalty_for_side_to_move(self) -> None:
+        board, _ = play("4k1n1/8/8/8/8/8/8/3QK1N1 w - - 0 1", KNIGHT_SHUFFLE)
+        self.assertEqual(
+            board.outcome(claim_draw=True).termination,
+            chess.Termination.THREEFOLD_REPETITION,
+        )
+        # White is to move in the repeated position, so White sees the penalty.
+        self.assertAlmostEqual(terminal_value(board), PENALTY)
+
+
+class TwofoldPruningTests(unittest.TestCase):
+    def test_twofold_inside_the_tree_is_terminal_with_penalty(self) -> None:
+        board, _ = play(KQK_SHUFFLE[0], KQK_SHUFFLE[1][:4])
+        self.assertTrue(board.is_repetition(2))
+        self.assertIsNone(board.outcome(claim_draw=True))
+        self.assertAlmostEqual(tree_leaf_value(board), PENALTY)
+        # The side that moved into the repeat (Black) is rewarded for holding it.
+        board.pop()
+        self.assertIsNone(tree_leaf_value(board))
+
+    def test_root_position_is_never_pruned_for_twofold(self) -> None:
+        board, _ = play(KQK_SHUFFLE[0], KQK_SHUFFLE[1][:4])
+        self.assertIsNone(tree_leaf_value(board, at_root=True))
+
+    def test_fresh_positions_are_not_terminal(self) -> None:
+        board = chess.Board()
+        board.push_uci("e2e4")
+        self.assertIsNone(tree_leaf_value(board))
+
+
+class DrawTests(unittest.TestCase):
     def test_full_game_at_the_cap_is_zero_even_a_queen_up(self) -> None:
         # Black has no queen; White does. The label must not care.
         board, records = play(
@@ -92,27 +157,21 @@ class DrawTests(unittest.TestCase):
         self.assertTrue(all(z == 0.0 for z in zs(data)))
         self.assertEqual(game_result(board, "MOVE_LIMIT", practice=False)[2], "MOVE_LIMIT")
 
-    def test_search_repetition_is_zero_even_with_unequal_pieces(self) -> None:
-        board, _ = play(
-            "4k1n1/8/8/8/8/8/8/3QK1N1 w - - 0 1",
-            KNIGHT_SHUFFLE,
-        )
-        self.assertEqual(
-            board.outcome(claim_draw=True).termination,
-            chess.Termination.THREEFOLD_REPETITION,
-        )
-        self.assertEqual(terminal_value(board), 0.0)
+    def test_stalemate_and_insufficient_material_stay_zero(self) -> None:
+        stale, _ = play("7k/8/6K1/8/8/8/8/5Q2 w - - 0 1", ["f1f7"])
+        self.assertTrue(stale.is_stalemate())
+        self.assertEqual(game_result(stale, None, practice=False)[0], 0.0)
+        self.assertEqual(terminal_value(stale), 0.0)
+        bare = chess.Board("8/8/8/8/8/8/8/4K2k w - - 0 1")
+        self.assertTrue(bare.is_insufficient_material())
+        self.assertEqual(game_result(bare, None, practice=False)[0], 0.0)
+        self.assertEqual(terminal_value(bare), 0.0)
 
 
 class StalledPracticeTests(unittest.TestCase):
     def test_practice_game_at_the_cap_is_dropped(self) -> None:
         board, records = play(KQK_SHUFFLE[0], KQK_SHUFFLE[1][:3])
         self.assertEqual(label_game(records, board, stop="MOVE_LIMIT", practice=True), [])
-
-    def test_practice_repetition_is_dropped(self) -> None:
-        board, records = play(*KQK_SHUFFLE)
-        self.assertIsNotNone(board.outcome(claim_draw=True))
-        self.assertEqual(label_game(records, board, stop=None, practice=True), [])
 
     def test_practice_stalemate_is_dropped(self) -> None:
         board, records = play("7k/8/6K1/8/8/8/8/5Q2 w - - 0 1", ["f1f7"])
@@ -136,15 +195,23 @@ class NoHumanValuesTests(unittest.TestCase):
         self.assertFalse(score_module.exists(), "human material scoring module still exists")
 
 
+class ZeroOracleTests(unittest.TestCase):
+    def test_training_modules_never_touch_a_tablebase(self) -> None:
+        for module in (labels, worker, practice, search, arena, train, pipeline, runtime):
+            source = inspect.getsource(module).lower()
+            for banned in ("syzygy", "tablebase", "evaluate.oracle", "import oracle"):
+                self.assertNotIn(banned, source, f"{banned} in {module.__name__}")
+
+
 class ReplayBufferTests(unittest.TestCase):
     def test_buffer_tensors_hold_the_honest_targets(self) -> None:
         mate_board, mate_records = play(*BACK_RANK)
         draw_board, draw_records = play(chess.STARTING_FEN, KNIGHT_SHUFFLE)
-        stall_board, stall_records = play(*KQK_SHUFFLE)
+        stale_board, stale_records = play("7k/8/6K1/8/8/8/8/5Q2 w - - 0 1", ["f1f7"])
         data = (
             label_game(mate_records, mate_board, None, practice=False)
             + label_game(draw_records, draw_board, None, practice=False)
-            + label_game(stall_records, stall_board, None, practice=True)
+            + label_game(stale_records, stale_board, None, practice=True)
         )
         with tempfile.TemporaryDirectory() as tmp:
             torch.save(data, os.path.join(tmp, "selfplay_test.pt"))
@@ -153,143 +220,9 @@ class ReplayBufferTests(unittest.TestCase):
         z = buffer.zs.reshape(-1).numpy()
         self.assertEqual(len(z), len(mate_records) + len(draw_records))
         np.testing.assert_allclose(z[:3], [GAMMA ** 3, -GAMMA ** 2, GAMMA], rtol=1e-6)
-        self.assertTrue(np.all(z[3:] == 0.0))
+        np.testing.assert_allclose(np.abs(z[3:]), [abs(PENALTY) * GAMMA ** (8 - i) for i in range(8)], rtol=1e-6)
         self.assertFalse(np.any(np.isclose(np.abs(z), 0.35)))
         self.assertTrue(np.all(buffer.weights.numpy() > 0.0))
-
-
-class SyzygyConfigurationTests(unittest.TestCase):
-    def test_syzygy_path_environment_variable_takes_priority(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "KQvK.rtbw").touch()
-            with (
-                mock.patch.dict(os.environ, {"SYZYGY_PATH": tmp}, clear=False),
-                mock.patch.object(labels.chess.syzygy, "open_tablebase", return_value="tablebase") as opener,
-            ):
-                self.assertEqual(open_tablebase(), "tablebase")
-        opener.assert_called_once_with(tmp)
-
-    def test_strict_runtime_rejects_unset_or_missing_path(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with self.assertRaisesRegex(RuntimeError, "SYZYGY_PATH is required"):
-                runtime.require_syzygy()
-        with mock.patch.dict(
-            os.environ,
-            {"SYZYGY_PATH": "/definitely/not/a/tablebase"},
-            clear=True,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "does not exist"):
-                runtime.require_syzygy()
-
-    def test_strict_runtime_probes_kqk_and_krk(self) -> None:
-        class ProbeTablebase:
-            def __init__(self):
-                self.boards = []
-                self.closed = False
-
-            def probe_wdl(self, board):
-                self.boards.append(board.copy())
-                return 2
-
-            def probe_dtz(self, _board):
-                return 1
-
-            def close(self):
-                self.closed = True
-
-        tablebase = ProbeTablebase()
-        with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "KQvK.rtbw").touch()
-            Path(tmp, "KQvK.rtbz").touch()
-            with (
-                mock.patch.dict(os.environ, {"SYZYGY_PATH": tmp}, clear=True),
-                mock.patch.object(
-                    runtime.chess.syzygy,
-                    "open_tablebase",
-                    return_value=tablebase,
-                ),
-            ):
-                opened, resolved = runtime.require_syzygy()
-
-        self.assertIs(opened, tablebase)
-        self.assertEqual(resolved, Path(tmp).resolve())
-        self.assertEqual(len(tablebase.boards), 2)
-        symbols = [{piece.symbol().lower() for piece in board.piece_map().values()} for board in tablebase.boards]
-        self.assertIn({"k", "q"}, symbols)
-        self.assertIn({"k", "r"}, symbols)
-
-    def test_probe_failure_closes_tables_and_fails_fast(self) -> None:
-        failing = mock.Mock()
-        failing.probe_wdl.side_effect = KeyError("missing table")
-        with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "KQvK.rtbw").touch()
-            Path(tmp, "KQvK.rtbz").touch()
-            with (
-                mock.patch.dict(os.environ, {"SYZYGY_PATH": tmp}, clear=True),
-                mock.patch.object(runtime.chess.syzygy, "open_tablebase", return_value=failing),
-                self.assertRaisesRegex(RuntimeError, "mandatory KQK/KRK probe failed"),
-            ):
-                runtime.require_syzygy()
-        failing.close.assert_called_once()
-
-
-class TablebaseValuePolicyTests(unittest.TestCase):
-    def test_decisive_wdl_uses_at_least_one_discount_step(self) -> None:
-        board = chess.Board("6k1/8/6K1/8/8/8/8/Q7 w - - 0 1")
-        for wdl, expected_sign in ((2, 1.0), (-2, -1.0)):
-            tablebase = mock.Mock()
-            tablebase.get_wdl.return_value = wdl
-            tablebase.get_dtz.return_value = 0
-            self.assertAlmostEqual(
-                tablebase_value(board, tablebase),
-                expected_sign * GAMMA,
-            )
-
-    def test_cursed_wins_and_blessed_losses_are_draws(self) -> None:
-        board = chess.Board("6k1/8/6K1/8/8/8/8/Q7 w - - 0 1")
-        for wdl in (-1, 0, 1):
-            tablebase = mock.Mock()
-            tablebase.get_wdl.return_value = wdl
-            self.assertEqual(tablebase_value(board, tablebase), 0.0)
-            tablebase.get_dtz.assert_not_called()
-
-
-@unittest.skipIf(TABLEBASE is None, "no Syzygy tables (syzygy/345 or $SYZYGY_PATH)")
-class TablebaseTests(unittest.TestCase):
-    def test_practice_mate_uses_dtz(self) -> None:
-        board, records = play("7k/8/5K2/8/8/8/8/Q7 w - - 0 1", ["f6g6", "h8g8", "a1a8"])
-        data = label_game(records, board, stop=None, practice=True, tablebase=TABLEBASE)
-        for rec, z in zip(records, zs(data)):
-            pos = chess.Board(rec.fen)
-            wdl = TABLEBASE.probe_wdl(pos)
-            dtz = TABLEBASE.probe_dtz(pos)
-            self.assertAlmostEqual(z, np.sign(wdl) * GAMMA ** abs(dtz), places=6)
-        self.assertGreater(zs(data)[0], 0.0)
-        self.assertLess(zs(data)[1], 0.0)
-
-    def test_bare_king_dtz_is_plies_to_mate(self) -> None:
-        # One move from mate: DTZ must say so (Syzygy may round by one ply).
-        pos = chess.Board("6k1/8/6K1/8/8/8/8/Q7 w - - 0 1")
-        self.assertIn(TABLEBASE.probe_dtz(pos), (1, 2))
-
-    def test_full_game_stops_and_labels_from_the_tables(self) -> None:
-        # With the cap lowered to 3 pieces, Qxb2 is the ply that enters the tables,
-        # so the recorded position before it is labelled from the tablebase result.
-        with mock.patch.object(labels, "TABLEBASE_MAX_PIECES", 3):
-            board, records = play("6k1/8/6K1/8/8/8/1r6/Q7 w - - 0 1", ["a1b2"])
-            self.assertFalse(labels.in_tablebase(chess.Board(records[0].fen), TABLEBASE))
-            self.assertTrue(labels.in_tablebase(board, TABLEBASE))
-            white, _, term = game_result(board, "TABLEBASE", practice=False, tablebase=TABLEBASE)
-            self.assertEqual((white, term), (1.0, "TABLEBASE"))
-            data = label_game(records, board, stop="TABLEBASE", practice=False, tablebase=TABLEBASE)
-        dtz_after = abs(TABLEBASE.probe_dtz(board))
-        np.testing.assert_allclose(zs(data), [GAMMA ** (1 + dtz_after)], rtol=1e-6)
-
-    def test_tablebase_draw_is_zero(self) -> None:
-        # Rook pawn, defending king in the corner.
-        pos = chess.Board("k7/8/8/8/8/8/P7/7K w - - 0 1")
-        self.assertEqual(TABLEBASE.probe_wdl(pos), 0)
-        self.assertEqual(tablebase_value(pos, TABLEBASE), 0.0)
 
 
 if __name__ == "__main__":

@@ -204,6 +204,11 @@ class PipelineArtifactTests(unittest.TestCase):
             ):
                 self.assertEqual(pipeline.run(args), 0)
 
+            self.assertEqual(train_mock.call_args.kwargs["data_dir"], run2.replay_dir)
+            self.assertEqual(
+                sorted(p.name for p in run2.replay_dir.iterdir()),
+                ["replay_iter_0970.pt"],
+            )
             seed = train_mock.call_args.kwargs["checkpoint"]
             self.assertEqual(seed["iteration"], 969)
             self.assertEqual(seed["optimizer_state"]["step"], 969)

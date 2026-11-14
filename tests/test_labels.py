@@ -1,8 +1,4 @@
-"""Policy 6: the label math is checked on tiny games before any training run.
-
-Each case builds a short game by hand, labels it, and inspects the replay
-buffer the way train.py loads it.
-"""
+"""Policy 6: the label math is checked on tiny games before any training run."""
 
 import inspect
 import os
@@ -21,7 +17,7 @@ from tabula.evaluate import arena
 from tabula.mcts import search
 from tabula.mcts.search import terminal_value, tree_leaf_value
 from tabula.selfplay import labels, practice, worker
-from tabula.selfplay.labels import GAMMA, Record, game_result, label_game
+from tabula.selfplay.labels import Record, game_result, label_game
 from tabula.train import train
 from tabula.train.train import SelfPlayDataset
 
@@ -56,22 +52,22 @@ KNIGHT_SHUFFLE = [
     "g1f3", "g8f6", "f3g1", "f6g8",
     "g1f3", "g8f6", "f3g1", "f6g8",
 ]
-# White (the strong side) starts the cycle: Qb2, Kg8, Qb1, Kh8, twice.
 KQK_SHUFFLE = ("7k/8/8/8/8/8/8/KQ6 w - - 0 1", ["b1b2", "h8g8", "b2b1", "g8h8"] * 2)
 
 
-class QuickMateTests(unittest.TestCase):
-    def test_mate_targets_are_discounted_by_plies_to_mate(self) -> None:
+class FlatMateTests(unittest.TestCase):
+    def test_mate_targets_are_flat_across_plies(self) -> None:
         board, records = play(*BACK_RANK)
         self.assertTrue(board.is_checkmate())
-        data = label_game(records, board, stop=None, practice=False)
-        expected = [GAMMA ** 3, -GAMMA ** 2, GAMMA ** 1]
+        data = label_game(records, board, stop=None)
+        expected = [1.0, -1.0, 1.0]
         np.testing.assert_allclose(zs(data), expected, rtol=1e-6)
 
-    def test_faster_mate_is_worth_more(self) -> None:
+    def test_no_gamma_discount_on_mate(self) -> None:
         board, records = play(*BACK_RANK)
-        data = label_game(records, board, stop=None, practice=False)
-        self.assertGreater(zs(data)[2], zs(data)[0])
+        data = label_game(records, board, stop=None)
+        self.assertEqual(zs(data)[0], zs(data)[2])
+        self.assertNotIn("GAMMA", labels.__dict__)
 
 
 class RepetitionPenaltyTests(unittest.TestCase):
@@ -81,19 +77,16 @@ class RepetitionPenaltyTests(unittest.TestCase):
             board.outcome(claim_draw=True).termination,
             chess.Termination.THREEFOLD_REPETITION,
         )
-        # The start position repeats with White to move: White initiated.
-        white, _, term = game_result(board, None, practice=False)
+        white, _, term = game_result(board, None)
         self.assertEqual(term, "THREEFOLD_REPETITION")
         self.assertAlmostEqual(white, PENALTY)
-        data = label_game(records, board, stop=None, practice=False)
+        data = label_game(records, board, stop=None)
         self.assertEqual(len(data), len(records))
-        # Last record: Black to move, one ply before the end.
-        self.assertAlmostEqual(zs(data)[-1], -PENALTY * GAMMA, places=6)
-        self.assertAlmostEqual(zs(data)[0], PENALTY * GAMMA ** 8, places=6)
+        # Flat: every White-to-move ply sees PENALTY, Black sees -PENALTY.
+        self.assertAlmostEqual(zs(data)[-1], -PENALTY, places=6)
+        self.assertAlmostEqual(zs(data)[0], PENALTY, places=6)
 
     def test_claim_by_move_charges_the_side_to_move_in_the_repeated_position(self) -> None:
-        # After 7 plies Black could claim with Kh8, which recreates the start
-        # position with White to move. White started the cycle and pays.
         board, _ = play(KQK_SHUFFLE[0], KQK_SHUFFLE[1][:7])
         self.assertFalse(board.is_repetition(3))
         self.assertEqual(
@@ -101,11 +94,11 @@ class RepetitionPenaltyTests(unittest.TestCase):
             chess.Termination.THREEFOLD_REPETITION,
         )
         self.assertEqual(labels.repetition_offender(board), chess.WHITE)
-        self.assertAlmostEqual(game_result(board, None, practice=True)[0], PENALTY)
+        self.assertAlmostEqual(game_result(board, None)[0], PENALTY)
 
     def test_strong_side_shuffle_is_penalised_not_rewarded(self) -> None:
         board, records = play(*KQK_SHUFFLE)
-        data = label_game(records, board, stop=None, practice=True)
+        data = label_game(records, board, stop=None)
         self.assertEqual(len(data), len(records))
         white_rows = [z for rec, z in zip(records, zs(data)) if rec.turn == chess.WHITE]
         self.assertTrue(all(z < 0.0 for z in white_rows))
@@ -113,7 +106,7 @@ class RepetitionPenaltyTests(unittest.TestCase):
     def test_penalty_is_configurable(self) -> None:
         board, _ = play(chess.STARTING_FEN, KNIGHT_SHUFFLE)
         with mock.patch.dict(os.environ, {"TABULA_REPETITION_PENALTY": "-0.5"}):
-            self.assertAlmostEqual(game_result(board, None, practice=False)[0], -0.5)
+            self.assertAlmostEqual(game_result(board, None)[0], -0.5)
 
     def test_search_terminal_uses_penalty_for_side_to_move(self) -> None:
         board, _ = play("4k1n1/8/8/8/8/8/8/3QK1N1 w - - 0 1", KNIGHT_SHUFFLE)
@@ -121,7 +114,6 @@ class RepetitionPenaltyTests(unittest.TestCase):
             board.outcome(claim_draw=True).termination,
             chess.Termination.THREEFOLD_REPETITION,
         )
-        # White is to move in the repeated position, so White sees the penalty.
         self.assertAlmostEqual(terminal_value(board), PENALTY)
 
 
@@ -131,7 +123,6 @@ class TwofoldPruningTests(unittest.TestCase):
         self.assertTrue(board.is_repetition(2))
         self.assertIsNone(board.outcome(claim_draw=True))
         self.assertAlmostEqual(tree_leaf_value(board), PENALTY)
-        # The side that moved into the repeat (Black) is rewarded for holding it.
         board.pop()
         self.assertIsNone(tree_leaf_value(board))
 
@@ -147,42 +138,45 @@ class TwofoldPruningTests(unittest.TestCase):
 
 class DrawTests(unittest.TestCase):
     def test_full_game_at_the_cap_is_zero_even_a_queen_up(self) -> None:
-        # Black has no queen; White does. The label must not care.
         board, records = play(
             "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
             ["g1f3", "g8f6", "f3g1"],
         )
-        data = label_game(records, board, stop="MOVE_LIMIT", practice=False)
+        data = label_game(records, board, stop="MOVE_LIMIT")
         self.assertEqual(len(data), len(records))
         self.assertTrue(all(z == 0.0 for z in zs(data)))
-        self.assertEqual(game_result(board, "MOVE_LIMIT", practice=False)[2], "MOVE_LIMIT")
+        self.assertEqual(game_result(board, "MOVE_LIMIT")[2], "MOVE_LIMIT")
 
     def test_stalemate_and_insufficient_material_stay_zero(self) -> None:
         stale, _ = play("7k/8/6K1/8/8/8/8/5Q2 w - - 0 1", ["f1f7"])
         self.assertTrue(stale.is_stalemate())
-        self.assertEqual(game_result(stale, None, practice=False)[0], 0.0)
+        self.assertEqual(game_result(stale, None)[0], 0.0)
         self.assertEqual(terminal_value(stale), 0.0)
         bare = chess.Board("8/8/8/8/8/8/8/4K2k w - - 0 1")
         self.assertTrue(bare.is_insufficient_material())
-        self.assertEqual(game_result(bare, None, practice=False)[0], 0.0)
+        self.assertEqual(game_result(bare, None)[0], 0.0)
         self.assertEqual(terminal_value(bare), 0.0)
 
 
-class StalledPracticeTests(unittest.TestCase):
-    def test_practice_game_at_the_cap_is_dropped(self) -> None:
+class CurriculumKeepTests(unittest.TestCase):
+    def test_curriculum_game_at_the_cap_is_kept(self) -> None:
         board, records = play(KQK_SHUFFLE[0], KQK_SHUFFLE[1][:3])
-        self.assertEqual(label_game(records, board, stop="MOVE_LIMIT", practice=True), [])
+        data = label_game(records, board, stop="MOVE_LIMIT", practice=True)
+        self.assertEqual(len(data), len(records))
+        self.assertTrue(all(z == 0.0 for z in zs(data)))
 
-    def test_practice_stalemate_is_dropped(self) -> None:
+    def test_curriculum_stalemate_is_kept(self) -> None:
         board, records = play("7k/8/6K1/8/8/8/8/5Q2 w - - 0 1", ["f1f7"])
         self.assertTrue(board.is_stalemate())
-        self.assertEqual(label_game(records, board, stop=None, practice=True), [])
+        data = label_game(records, board, stop=None, practice=True)
+        self.assertEqual(len(data), len(records))
 
-    def test_practice_mate_is_kept(self) -> None:
+    def test_curriculum_mate_is_kept(self) -> None:
         board, records = play("7k/8/5K2/8/8/8/8/Q7 w - - 0 1", ["f6g6", "h8g8", "a1a8"])
         self.assertTrue(board.is_checkmate())
         data = label_game(records, board, stop=None, practice=True)
         self.assertEqual(len(data), 3)
+        np.testing.assert_allclose(zs(data), [1.0, -1.0, 1.0], rtol=1e-6)
 
 
 class NoHumanValuesTests(unittest.TestCase):
@@ -204,13 +198,13 @@ class ZeroOracleTests(unittest.TestCase):
 
 
 class ReplayBufferTests(unittest.TestCase):
-    def test_buffer_tensors_hold_the_honest_targets(self) -> None:
+    def test_buffer_tensors_hold_the_flat_targets(self) -> None:
         mate_board, mate_records = play(*BACK_RANK)
         draw_board, draw_records = play(chess.STARTING_FEN, KNIGHT_SHUFFLE)
         stale_board, stale_records = play("7k/8/6K1/8/8/8/8/5Q2 w - - 0 1", ["f1f7"])
         data = (
-            label_game(mate_records, mate_board, None, practice=False)
-            + label_game(draw_records, draw_board, None, practice=False)
+            label_game(mate_records, mate_board, None)
+            + label_game(draw_records, draw_board, None)
             + label_game(stale_records, stale_board, None, practice=True)
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -218,9 +212,9 @@ class ReplayBufferTests(unittest.TestCase):
             buffer = SelfPlayDataset(tmp)
 
         z = buffer.zs.reshape(-1).numpy()
-        self.assertEqual(len(z), len(mate_records) + len(draw_records))
-        np.testing.assert_allclose(z[:3], [GAMMA ** 3, -GAMMA ** 2, GAMMA], rtol=1e-6)
-        np.testing.assert_allclose(np.abs(z[3:]), [abs(PENALTY) * GAMMA ** (8 - i) for i in range(8)], rtol=1e-6)
+        self.assertEqual(len(z), len(mate_records) + len(draw_records) + len(stale_records))
+        np.testing.assert_allclose(z[:3], [1.0, -1.0, 1.0], rtol=1e-6)
+        np.testing.assert_allclose(np.abs(z[3:11]), [abs(PENALTY)] * 8, rtol=1e-6)
         self.assertFalse(np.any(np.isclose(np.abs(z), 0.35)))
         self.assertTrue(np.all(buffer.weights.numpy() > 0.0))
 

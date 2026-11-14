@@ -91,10 +91,14 @@ POSITIONS = [
 
 
 def load_model(model_path, num_res_blocks):
+    from tabula.checkpoint import load_model_weights
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TabulaNet(num_res_blocks=num_res_blocks).to(device)
     if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        raw = torch.load(model_path, map_location=device, weights_only=True)
+        state = raw["model_state"] if isinstance(raw, dict) and "model_state" in raw else raw
+        load_model_weights(model, state)
         print(f"Loaded {model_path} on {device}")
     else:
         print(f"WARNING: no weights at {model_path} — running with random weights on {device}")

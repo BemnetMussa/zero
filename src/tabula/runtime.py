@@ -49,6 +49,10 @@ class RunPaths:
     def snapshot_dir(self) -> Path:
         return self.root / "snapshots"
 
+    @property
+    def pgn_dir(self) -> Path:
+        return self.root / "pgn_dumps"
+
     def checkpoint_path(self, iteration: int) -> Path:
         return self.root / f"weights_iter_{iteration:04d}.pt"
 
@@ -58,10 +62,14 @@ class RunPaths:
     def snapshot_path(self, iteration: int) -> Path:
         return self.snapshot_dir / f"model_iter_{iteration:04d}.pt"
 
+    def pgn_path(self, iteration: int) -> Path:
+        return self.pgn_dir / f"iter_{iteration:04d}.pgn"
+
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.replay_dir.mkdir(parents=True, exist_ok=True)
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self.pgn_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _temporary_path(path: Path) -> Path:

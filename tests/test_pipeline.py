@@ -17,12 +17,24 @@ class FakeWorker:
     def __init__(self, **_kwargs):
         self._outcomes = list(type(self).outcomes)
         self.last_termination = None
+        self.last_telemetry = None
+        self.last_pgn = None
 
     def play_game(self, **_kwargs):
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
-        data, self.last_termination = outcome
+        if len(outcome) == 2:
+            data, self.last_termination = outcome
+            tier = 4 if self.last_termination == "MOVE_LIMIT" and data else 1
+            if self.last_termination == "MOVE_LIMIT" and not data:
+                tier = 1
+            self.last_telemetry = {"tier": tier}
+            self.last_pgn = f"[Event \"fake\"]\n\n*\n" if data else None
+            return data
+        data, self.last_termination, tier = outcome
+        self.last_telemetry = {"tier": tier}
+        self.last_pgn = f"[Event \"tier{tier}\"]\n\n*\n"
         return data
 
 
@@ -38,13 +50,13 @@ class SelfPlayResilienceTests(unittest.TestCase):
     def test_one_transient_error_continues_within_budget(self) -> None:
         FakeWorker.outcomes = [
             RuntimeError("bad rollout"),
-            ([1], "CHECKMATE"),
-            ([2], "CHECKMATE"),
-            ([3], "CHECKMATE"),
-            ([4], "CHECKMATE"),
+            ([1], "CHECKMATE", 1),
+            ([2], "CHECKMATE", 1),
+            ([3], "CHECKMATE", 2),
+            ([4], "CHECKMATE", 2),
         ]
         with tempfile.TemporaryDirectory() as tmp:
-            data, stats = pipeline.run_selfplay_phase(
+            data, stats, mates, draws = pipeline.run_selfplay_phase(
                 FakeWorker(),
                 games=5,
                 iteration=1,
@@ -54,14 +66,16 @@ class SelfPlayResilienceTests(unittest.TestCase):
         self.assertEqual(data, [1, 2, 3, 4])
         self.assertEqual(stats.game_errors, 1)
         self.assertEqual(stats.games_completed, 4)
+        self.assertEqual(len(mates), 4)
+        self.assertEqual(draws, [])
 
     def test_exceeding_error_budget_aborts_iteration(self) -> None:
         FakeWorker.outcomes = [
             RuntimeError("first"),
-            ([1], "CHECKMATE"),
+            ([1], "CHECKMATE", 1),
             RuntimeError("second"),
-            ([2], "CHECKMATE"),
-            ([3], "CHECKMATE"),
+            ([2], "CHECKMATE", 1),
+            ([3], "CHECKMATE", 1),
         ]
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(RuntimeError):
             pipeline.run_selfplay_phase(
@@ -72,24 +86,30 @@ class SelfPlayResilienceTests(unittest.TestCase):
                 metrics_path=Path(tmp) / "metrics.jsonl",
             )
 
-    def test_stalled_practice_and_full_board_cap_are_counted(self) -> None:
+    def test_tier4_cap_and_curriculum_mates_are_counted(self) -> None:
         FakeWorker.outcomes = [
-            ([1], "MOVE_LIMIT"),
-            ([], "MOVE_LIMIT"),
-            ([2], "CHECKMATE"),
+            ([1], "MOVE_LIMIT", 4),
+            ([2], "THREEFOLD_REPETITION", 2),
+            ([3], "CHECKMATE", 1),
         ]
         with tempfile.TemporaryDirectory() as tmp:
-            _, stats = pipeline.run_selfplay_phase(
+            _, stats, mates, draws = pipeline.run_selfplay_phase(
                 FakeWorker(),
                 games=3,
                 iteration=1,
                 max_game_error_rate=0.20,
                 metrics_path=Path(tmp) / "metrics.jsonl",
             )
-        self.assertEqual(stats.stalled_rollouts_dropped, 1)
+        self.assertEqual(stats.stalled_rollouts_dropped, 0)
         self.assertEqual(stats.cap_terminations, 1)
-        self.assertEqual(stats.full_board_games, 2)
-        self.assertEqual(stats.cap_termination_rate, 0.5)
+        self.assertEqual(stats.full_board_games, 1)
+        self.assertEqual(stats.cap_termination_rate, 1.0)
+        self.assertEqual(stats.practice_mates, 1)
+        self.assertEqual(stats.tier_counts[1], 1)
+        self.assertEqual(stats.tier_counts[2], 1)
+        self.assertEqual(stats.tier_counts[4], 1)
+        self.assertEqual(len(mates), 1)
+        self.assertEqual(len(draws), 2)
 
     def test_cap_tripwire_warns_above_fifteen_percent(self) -> None:
         metrics = {
@@ -160,7 +180,7 @@ class PipelineArtifactTests(unittest.TestCase):
             learning_rate=0.0005,
             examples=2,
         )
-        FakeWorker.outcomes = [([("state", "pi", "z", "weight")], "CHECKMATE")]
+        FakeWorker.outcomes = [([("state", "pi", "z", "weight")], "CHECKMATE", 1)]
         with tempfile.TemporaryDirectory() as tmp:
             run1 = RunPaths.from_value(Path(tmp) / "run1")
             run1.ensure()
@@ -234,7 +254,7 @@ class PipelineArtifactTests(unittest.TestCase):
             learning_rate=0.001,
             examples=1,
         )
-        FakeWorker.outcomes = [([("state", "pi", "z", "weight")], "CHECKMATE")]
+        FakeWorker.outcomes = [([("state", "pi", "z", "weight")], "CHECKMATE", 1)]
 
         with tempfile.TemporaryDirectory() as tmp:
             args = pipeline.parse_args(

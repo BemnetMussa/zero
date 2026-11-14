@@ -1,18 +1,15 @@
 """How a finished self-play game becomes replay-buffer entries.
 
-Rules (Zero policies, 2026-11-13 — zero oracles, bare rules only):
+Rules (Zero Run #3 — Pure AlphaZero flat terminals, zero oracles):
 
-- A mate is worth GAMMA ** N for the side that delivers it, where N is the
-  number of plies from the recorded position to the mate. The loser gets the
-  negative. Faster mates are worth more.
-- Stalemate, the 50-move rule, and insufficient material are 0.
+- Checkmate is flat ±1.0 for every recorded ply (winner / loser from that
+  side-to-move's view). Search and train share the same scale.
+- Stalemate, the 50-move rule, 75-move rule, and insufficient material are 0.
 - Threefold / fivefold repetition costs the side that initiated the loop the
   repetition penalty (default -0.20, env TABULA_REPETITION_PENALTY); the other
-  side gets the opposite sign. The initiator is the side to move in the
-  repeated position: it kept choosing to leave that position on the same cycle.
-- A full-board game that hits MAX_PLIES is 0 and stays in the buffer.
-- A practice game is kept only if it ends in mate or repetition; anything else
-  (stalemate, insufficient material, 50-move, cap) is dropped whole.
+  side gets the opposite sign. Flat — no gamma discount.
+- A game that hits MAX_PLIES is 0 and stays in the buffer.
+- Every finished curriculum game is kept (mates and draws alike).
 
 No piece values and no external solvers: the only input is the game outcome.
 """
@@ -25,12 +22,10 @@ from dataclasses import dataclass
 import chess
 import numpy as np
 
-GAMMA = 0.99
 MAX_PLIES = 200
 LATE_WEIGHT_FLOOR = 0.2
 DEFAULT_REPETITION_PENALTY = -0.20
 REPETITION_TERMINATIONS = frozenset({"THREEFOLD_REPETITION", "FIVEFOLD_REPETITION"})
-PRACTICE_KEEP_TERMINATIONS = frozenset({"CHECKMATE"}) | REPETITION_TERMINATIONS
 
 
 @dataclass
@@ -70,11 +65,14 @@ def white_repetition_value(board: chess.Board, reached: int = 3) -> float:
     return penalty if repetition_offender(board, reached) == chess.WHITE else -penalty
 
 
-def game_result(board, stop, practice):
+def game_result(board, stop, practice=False):
     """White's result, a short label, and why the game ended.
 
     `stop` is "MOVE_LIMIT" when the loop ended the game itself.
+    `practice` is retained for call-site compatibility and ignored: every finished
+    game is labelled the same way under Run #3.
     """
+    del practice  # Run #3: no special drop path for curriculum games.
     outcome = board.outcome(claim_draw=True)
     if outcome is not None and outcome.winner is not None:
         white = 1.0 if outcome.winner == chess.WHITE else -1.0
@@ -83,21 +81,16 @@ def game_result(board, stop, practice):
     termination = outcome.termination.name if outcome is not None else (stop or "UNFINISHED")
     if termination in REPETITION_TERMINATIONS:
         return white_repetition_value(board), "DRAW", termination
-    if practice:
-        return 0.0, "NO MATE", termination
     return 0.0, "DRAW", termination
 
 
-def label_game(records, board, stop, practice):
+def label_game(records, board, stop, practice=False):
     """Turn a finished game into (s, π, z, w) tuples for the replay buffer.
 
-    `board` is the final board with its move stack; each record's `ply` counts
-    from the board the game started on.
+    Flat AlphaZero terminals: mate ±1, draws 0, repetition ±penalty — no gamma.
     """
-    white, _, termination = game_result(board, stop, practice)
-    if practice and termination not in PRACTICE_KEEP_TERMINATIONS:
-        return []
-
+    del practice
+    white, _, _termination = game_result(board, stop, practice=False)
     plies = len(board.move_stack)
     training_data = []
     total_plies = max(plies, 1)
@@ -106,7 +99,7 @@ def label_game(records, board, stop, practice):
             z = 0.0
         else:
             side = white if rec.turn == chess.WHITE else -white
-            z = side * GAMMA ** (plies - rec.ply)
+            z = float(side)
         late = LATE_WEIGHT_FLOOR + (1.0 - LATE_WEIGHT_FLOOR) * (rec.ply / total_plies)
         surprise = 1.0 + abs(rec.v_prior - rec.q_root)
         training_data.append((

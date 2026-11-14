@@ -56,6 +56,11 @@ class SelfPlayStats:
     practice_mates: int = 0
     stalled_rollouts_dropped: int = 0
     replay_examples: int = 0
+    tier_counts: dict[int, int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.tier_counts is None:
+            self.tier_counts = {1: 0, 2: 0, 3: 0, 4: 0}
 
     @property
     def cap_termination_rate(self) -> float:
@@ -74,6 +79,21 @@ def _allowed_game_errors(games_requested: int, maximum_rate: float) -> int:
     return max(1, math.floor(games_requested * maximum_rate))
 
 
+def write_iteration_pgn(
+    path: Path,
+    mate_pgns: list[str],
+    draw_pgns: list[str],
+    *,
+    max_draws: int = 5,
+) -> Path:
+    """Write all checkmates plus up to `max_draws` sample draws for the iteration."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    selected = list(mate_pgns) + list(draw_pgns[:max_draws])
+    path.write_text("".join(selected), encoding="utf-8")
+    return path
+
+
 def run_selfplay_phase(
     worker: SelfPlayWorker,
     games: int,
@@ -83,8 +103,11 @@ def run_selfplay_phase(
     *,
     live: LiveBoard | None = None,
     thermal: ThermalGuard | None = None,
-) -> tuple[list[Any], SelfPlayStats]:
-    """Run self-play while tolerating a bounded number of game-level failures."""
+) -> tuple[list[Any], SelfPlayStats, list[str], list[str]]:
+    """Run self-play while tolerating a bounded number of game-level failures.
+
+    Returns replay rows, stats, mate PGNs, and draw PGNs collected this iteration.
+    """
 
     if games <= 0:
         raise ValueError("games must be positive")
@@ -94,17 +117,16 @@ def run_selfplay_phase(
     all_data: list[Any] = []
     stats = SelfPlayStats(games_requested=games)
     allowed_errors = _allowed_game_errors(games, max_game_error_rate)
+    mate_pgns: list[str] = []
+    draw_pgns: list[str] = []
 
     for game_index in range(games):
-        practice = game_index % 2 == 1
         stats.games_attempted += 1
-        if practice:
-            stats.practice_games += 1
 
         try:
             if thermal is not None:
                 thermal.check_and_cool()
-            data = worker.play_game(live=live, practice=practice)
+            data = worker.play_game(live=live)
         except Exception as exc:
             stats.game_errors += 1
             error_traceback = traceback.format_exc()
@@ -118,7 +140,6 @@ def run_selfplay_phase(
                 "game_error",
                 iteration_idx=iteration,
                 game_index=game_index + 1,
-                mate_practice=practice,
                 error=repr(exc),
                 traceback=error_traceback,
             )
@@ -131,15 +152,23 @@ def run_selfplay_phase(
 
         stats.games_completed += 1
         termination = worker.last_termination
-        if practice:
-            if termination == "CHECKMATE":
-                stats.practice_mates += 1
-            elif not data:
-                stats.stalled_rollouts_dropped += 1
-        else:
+        telemetry = getattr(worker, "last_telemetry", None) or {}
+        tier = int(telemetry.get("tier", 4))
+        stats.tier_counts[tier] = stats.tier_counts.get(tier, 0) + 1
+        stats.practice_games += 1 if tier < 4 else 0
+        if tier == 4:
             stats.full_board_games += 1
             if termination == "MOVE_LIMIT":
                 stats.cap_terminations += 1
+        if termination == "CHECKMATE":
+            stats.practice_mates += 1
+            pgn = getattr(worker, "last_pgn", None)
+            if pgn:
+                mate_pgns.append(pgn)
+        else:
+            pgn = getattr(worker, "last_pgn", None)
+            if pgn:
+                draw_pgns.append(pgn)
 
         all_data.extend(data)
 
@@ -154,7 +183,7 @@ def run_selfplay_phase(
         raise RuntimeError("Self-play completed but produced no replay examples")
 
     stats.replay_examples = len(all_data)
-    return all_data, stats
+    return all_data, stats, mate_pgns, draw_pgns
 
 
 def _seed_weights(paths: RunPaths, checkpoint: dict[str, Any] | None) -> Path | None:
@@ -383,7 +412,7 @@ def run(args: argparse.Namespace) -> int:
                     num_simulations=args.simulations,
                     num_res_blocks=DEFAULT_RES_BLOCKS,
                 )
-                replay, stats = run_selfplay_phase(
+                replay, stats, mate_pgns, draw_pgns = run_selfplay_phase(
                     worker,
                     args.games,
                     iteration,
@@ -393,6 +422,17 @@ def run(args: argparse.Namespace) -> int:
                     thermal=thermal,
                 )
                 atomic_torch_save(replay, paths.replay_path(iteration))
+                if args.mate_exam_every and iteration % args.mate_exam_every == 0:
+                    write_iteration_pgn(
+                        paths.pgn_path(iteration),
+                        mate_pgns,
+                        draw_pgns,
+                        max_draws=5,
+                    )
+                    print(
+                        f"PGN dump: {paths.pgn_path(iteration)} "
+                        f"({len(mate_pgns)} mates, {min(5, len(draw_pgns))} draws)"
+                    )
 
                 result = train(
                     data_dir=paths.replay_dir,
@@ -409,6 +449,7 @@ def run(args: argparse.Namespace) -> int:
                 if args.mate_exam_every and iteration % args.mate_exam_every == 0:
                     run_mate_exam(
                         str(candidate_path),
+                        num_simulations=args.simulations,
                         out_path=str(paths.root / f"mate_exam_iter_{iteration:04d}.json"),
                     )
                 promoted = not paths.champion_weights.exists()
@@ -502,6 +543,11 @@ def run(args: argparse.Namespace) -> int:
                 model_path = paths.latest_weights
                 previous_iteration_seconds = duration
                 iteration += 1
+                # Drop the per-iteration self-play worker graph, then release
+                # cached CUDA blocks so VRAM does not creep across 150+ iters.
+                del worker, result, replay
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
             except Exception as exc:
                 if candidate_path is not None:
                     candidate_path.unlink(missing_ok=True)

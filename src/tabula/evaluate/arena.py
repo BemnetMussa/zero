@@ -36,18 +36,26 @@ class Arena:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Arena running on: {self.device} ({num_res_blocks} ResBlocks, {num_simulations} sims)")
         
+        from tabula.checkpoint import load_model_weights
+
         # 1. Load the Champion
         self.champion = TabulaNet(num_res_blocks=num_res_blocks).to(self.device)
         if os.path.exists(champion_path):
-            self.champion.load_state_dict(torch.load(champion_path, map_location=self.device, weights_only=True))
+            load_model_weights(
+                self.champion,
+                torch.load(champion_path, map_location=self.device, weights_only=True),
+            )
         else:
             print(f"Warning: No champion found at {champion_path}. Using random weights.")
         self.champion.eval()
-        
+
         # 2. Load the Challenger
         self.challenger = TabulaNet(num_res_blocks=num_res_blocks).to(self.device)
         if os.path.exists(challenger_path):
-            self.challenger.load_state_dict(torch.load(challenger_path, map_location=self.device, weights_only=True))
+            load_model_weights(
+                self.challenger,
+                torch.load(challenger_path, map_location=self.device, weights_only=True),
+            )
         else:
             print(f"Warning: No challenger found at {challenger_path}. Using random weights.")
         self.challenger.eval()

@@ -9,6 +9,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+from tabula.checkpoint import load_model_weights, load_training_state
+from tabula.game.encoder import INPUT_PLANES
 from tabula.model.model import TabulaNet
 from tabula.runtime import atomic_torch_save
 
@@ -44,11 +46,16 @@ class SelfPlayDataset(Dataset):
 
         Each item may be (s, π, z) from v0.2 or (s, π, z, w) from v0.3.
         Missing weights default to 1.0.
+
+        Run #3: only INPUT_PLANES (20) board tensors are accepted. Stale Run #2
+        13-channel rows are skipped so a leftover replay file cannot crash training
+        mid-batch with a silent shape mismatch.
         """
         pt_files = sorted(glob.glob(os.path.join(data_dir, "*.pt")), key=os.path.getmtime)
         selected_files = pt_files[-max_files:] if len(pt_files) > max_files else pt_files
         
         all_states, all_pis, all_zs, all_ws = [], [], [], []
+        skipped_incompatible = 0
         for f in selected_files:
             data = torch.load(f, weights_only=False)
             for item in data:
@@ -57,6 +64,10 @@ class SelfPlayDataset(Dataset):
                 else:
                     s, pi, z = item
                     w = np.array([1.0], dtype=np.float32)
+                s = np.asarray(s)
+                if s.ndim != 3 or s.shape[0] != INPUT_PLANES:
+                    skipped_incompatible += 1
+                    continue
                 all_states.append(s)
                 all_pis.append(pi)
                 all_zs.append(z)
@@ -68,12 +79,21 @@ class SelfPlayDataset(Dataset):
             self.zs = torch.from_numpy(np.array(all_zs, dtype=np.float32))
             self.weights = torch.from_numpy(np.array(all_ws, dtype=np.float32)).reshape(-1)
         else:
-            self.states = torch.empty((0, 13, 8, 8), dtype=torch.float32)
+            self.states = torch.empty((0, INPUT_PLANES, 8, 8), dtype=torch.float32)
             self.pis = torch.empty((0, 4672), dtype=torch.float32)
             self.zs = torch.empty((0, 1), dtype=torch.float32)
             self.weights = torch.empty((0,), dtype=torch.float32)
-            
-        print(f"Loaded {len(self.states)} examples from {len(selected_files)} recent files (Replay buffer window).")
+
+        msg = (
+            f"Loaded {len(self.states)} examples from {len(selected_files)} recent files "
+            f"(Replay buffer window)."
+        )
+        if skipped_incompatible:
+            msg += (
+                f" Skipped {skipped_incompatible} incompatible board tensors "
+                f"(expected {INPUT_PLANES} planes)."
+            )
+        print(msg)
 
     def __len__(self):
         return len(self.states)
@@ -143,14 +163,21 @@ def train(
 
     if checkpoint is not None:
         print(f"Restoring iteration {checkpoint['iteration']} training state...")
-        model.load_state_dict(checkpoint["model_state"])
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
-        scheduler.load_state_dict(checkpoint["scheduler_state"])
+        padded = load_training_state(model, optimizer, scheduler, checkpoint)
+        if padded:
+            print(
+                f"Warm-started model to {INPUT_PLANES} input planes; "
+                "optimizer/scheduler reset."
+            )
     elif model_path and os.path.exists(model_path):
         print(f"Found existing weights. Loading from {model_path}...")
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        raw = torch.load(model_path, map_location=device, weights_only=True)
+        state = raw["model_state"] if isinstance(raw, dict) and "model_state" in raw else raw
+        padded = load_model_weights(model, state)
+        if padded:
+            print(f"Warm-started weights to {INPUT_PLANES} input planes.")
     else:
-        print("Starting with fresh randomly initialized weights (v0.2 / perspective / 8 blocks).")
+        print("Starting with fresh randomly initialized weights (8 blocks / 20 planes).")
     
     # 3. Loss functions
     # Per-sample losses so LATE / surprise weights can scale each row.

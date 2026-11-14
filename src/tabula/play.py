@@ -10,6 +10,8 @@ from tabula.model.model import TabulaNet
 from tabula.game.encoder import encode_board
 from tabula.mcts.search import MCTS
 
+from tabula.checkpoint import load_model_weights
+
 DEFAULT_RES_BLOCKS = 8
 WEIGHTS = "models/tabula_v0.2_champion.pth"
 
@@ -18,13 +20,13 @@ def main() -> None:
     print("Loading Zero net (v0.2, 8 ResBlocks)...")
     model = TabulaNet(num_res_blocks=DEFAULT_RES_BLOCKS)
     if os.path.exists(WEIGHTS):
-        model.load_state_dict(torch.load(WEIGHTS, map_location="cpu", weights_only=True))
+        load_model_weights(model, torch.load(WEIGHTS, map_location="cpu", weights_only=True))
         print(f"Loaded {WEIGHTS}")
     else:
         print(f"No champion at {WEIGHTS}; playing with random weights.")
     model.eval()
 
-    mcts = MCTS(model, num_simulations=80, c_puct=1.25)
+    mcts = MCTS(model, num_simulations=128, c_puct=1.25)
 
     game = Game()
     print("You are White. Zero v0.2 (MCTS) is Black.")

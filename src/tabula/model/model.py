@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tabula.game.encoder import INPUT_PLANES
+
+
 class ResBlock(nn.Module):
     """
     A standard Residual Block. 
@@ -26,19 +29,25 @@ class ResBlock(nn.Module):
 
 class TabulaNet(nn.Module):
     """
-    The Version 1 PyTorch Neural Network for Tabula AI (AlphaZero architecture).
-    Input: (Batch Size, 13, 8, 8) tensor representing the static board.
-    Outputs: 
-        - Policy: Probability distribution over all possible moves.
-        - Value: A single number [-1, 1] estimating who is winning.
+    AlphaZero dual-head network for Zero.
+    Input: (Batch Size, INPUT_PLANES, 8, 8) board + rule-state tensor.
+    Outputs:
+        - Policy: logits over the 4672-move action space.
+        - Value: scalar in [-1, 1] for the side to move.
     """
-    def __init__(self, num_res_blocks=5, num_hidden=256, action_size=4672):
+    def __init__(
+        self,
+        num_res_blocks=5,
+        num_hidden=256,
+        action_size=4672,
+        input_planes=INPUT_PLANES,
+    ):
         super().__init__()
-        
+        self.input_planes = input_planes
+
         # 1. The Input Block
-        # Takes our 13-layer board representation and expands it to 'num_hidden' filters
         self.start_block = nn.Sequential(
-            nn.Conv2d(13, num_hidden, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(input_planes, num_hidden, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(num_hidden),
             nn.ReLU()
         )
@@ -91,17 +100,10 @@ class TabulaNet(nn.Module):
         return policy_logits, value
 
 if __name__ == "__main__":
-    # --- QUICK TEST TO VERIFY SHAPES ---
-    print("Initializing TabulaNet (v0.2 default shape check)...")
+    print("Initializing TabulaNet shape check...")
     model = TabulaNet(num_res_blocks=8)
-    
-    # Create a dummy input tensor matching our 13-layer V1 design
-    # Shape: (Batch_Size=1, Channels=13, Height=8, Width=8)
-    dummy_input = torch.randn(1, 13, 8, 8)
-    
-    # Run the dummy input through the network
+    dummy_input = torch.randn(1, INPUT_PLANES, 8, 8)
     policy, value = model(dummy_input)
-    
     print(f"Input Shape:  {dummy_input.shape}")
     print(f"Policy Shape: {policy.shape} -> (Batch Size, Action Space Size)")
     print(f"Value Shape:  {value.shape}  -> (Batch Size, Evaluation)")

@@ -22,7 +22,7 @@ from tabula.evaluate.benchmark import DEFAULT_MODEL, load_model
 from tabula.game.encoder import encode_board
 from tabula.evaluate.oracle import open_syzygy, optimal_dtz
 from tabula.mcts.search import MCTS
-from tabula.selfplay.practice import random_practice_board
+from tabula.selfplay.practice import sample_mate_exam_board
 from tabula.selfplay.worker import DEFAULT_RES_BLOCKS
 
 EXAM_SEED = 7
@@ -32,7 +32,7 @@ EXAM_MAX_PLIES = 100
 
 def exam_boards(n=EXAM_BOARDS, seed=EXAM_SEED):
     rng = random.Random(seed)
-    return [random_practice_board(rng) for _ in range(n)]
+    return [sample_mate_exam_board(rng) for _ in range(n)]
 
 
 def play_out(mcts, board):

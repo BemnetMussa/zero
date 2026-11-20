@@ -132,6 +132,7 @@ class SelfPlayPathTests(unittest.TestCase):
         worker.last_telemetry = None
         worker.last_pgn = None
         worker.last_tier = None
+        worker.curriculum_weights = None
 
         start = sample_curriculum_board(random.Random(0), tier=1)
         # Force the known mate-in-1 board.

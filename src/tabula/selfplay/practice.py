@@ -234,19 +234,31 @@ _GENERATORS = {
 }
 
 
-def choose_tier(rng=random) -> int:
-    draw = rng.random()
+def choose_tier(rng=random, weights: dict[int, float] | None = None) -> int:
+    """Sample a tier from `weights` (or the legacy Run #3 mix)."""
+    table = weights if weights is not None else TIER_WEIGHTS
+    active = {int(t): float(w) for t, w in table.items() if float(w) > 0.0}
+    if not active:
+        return 1
+    total = sum(active.values())
+    draw = rng.random() * total
     cumulative = 0.0
-    for tier, weight in TIER_WEIGHTS.items():
+    last = 1
+    for tier, weight in sorted(active.items()):
         cumulative += weight
+        last = tier
         if draw < cumulative:
             return tier
-    return 4
+    return last
 
 
-def sample_curriculum_board(rng=random, tier: int | None = None) -> CurriculumStart:
+def sample_curriculum_board(
+    rng=random,
+    tier: int | None = None,
+    weights: dict[int, float] | None = None,
+) -> CurriculumStart:
     """Sample a legal non-terminal board from the 4-tier piece staircase."""
-    chosen = choose_tier(rng) if tier is None else int(tier)
+    chosen = choose_tier(rng, weights=weights) if tier is None else int(tier)
     if chosen not in _GENERATORS:
         raise ValueError(f"Unknown curriculum tier: {chosen}")
     board = _GENERATORS[chosen](rng)

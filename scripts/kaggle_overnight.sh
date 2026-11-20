@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Tabula / Zero overnight Kaggle launcher.
-# Run #3: Pure AlphaZero full search, 20-plane encoder, 4-tier staircase.
-# Fresh replay only on first Run #3 launch; warm-start from newest Run #2 weights.
+# Tabula / Zero Kaggle launcher — Run #4 gated curriculum.
+# Warm-start from Run #2 weights. Bidirectional mate-exam gate.
+# Default: ~4.5 h canary. Overnight only if the exam holds.
 set -euo pipefail
 
 export PYTHONPATH="${PYTHONPATH:-src}"
@@ -13,6 +13,10 @@ ZERO_GAMES="${ZERO_GAMES:-8}"
 KAGGLE_INPUT="${KAGGLE_INPUT:-/kaggle/input}"
 # Explicit overrides (either name works).
 ZERO_RESUME_FROM="${ZERO_RESUME_FROM:-${ZERO_SEED_WEIGHTS:-}}"
+# Gate thresholds (mates out of 20).
+ZERO_CURRICULUM_UNLOCK_UP="${ZERO_CURRICULUM_UNLOCK_UP:-16}"
+ZERO_CURRICULUM_DROP_DOWN="${ZERO_CURRICULUM_DROP_DOWN:-12}"
+ZERO_CURRICULUM_UNLOCK_STREAK="${ZERO_CURRICULUM_UNLOCK_STREAK:-2}"
 
 pick_newest_iter_checkpoint() {
   # Print the weights_iter_XXXX.pt with the highest iteration number under $1.
@@ -52,7 +56,6 @@ resolve_seed() {
     return 0
   fi
   if [[ ${#latests[@]} -gt 1 ]]; then
-    # Newest by mtime
     local newest=""
     newest="$(ls -t "${latests[@]}" 2>/dev/null | head -n 1 || true)"
     if [[ -n "$newest" && -e "$newest" ]]; then
@@ -77,13 +80,14 @@ else
   RESUME_PATH=""
 fi
 
-echo "=== Tabula Run #3 launcher ==="
+echo "=== Tabula Run #4 launcher (gated curriculum) ==="
 echo "ZERO_OUTPUT_DIR=${ZERO_OUTPUT_DIR}"
 echo "ZERO_SIMULATIONS=${ZERO_SIMULATIONS}"
 echo "ZERO_GAMES=${ZERO_GAMES}"
 echo "ZERO_TIME_LIMIT_HOURS=${ZERO_TIME_LIMIT_HOURS}"
 echo "TABULA_REPETITION_PENALTY=${TABULA_REPETITION_PENALTY}"
 echo "ZERO_RESUME_FROM=${RESUME_PATH:-<none>}"
+echo "GATE unlock>=${ZERO_CURRICULUM_UNLOCK_UP}/20 x${ZERO_CURRICULUM_UNLOCK_STREAK} | drop<=${ZERO_CURRICULUM_DROP_DOWN}/20"
 
 mkdir -p "${ZERO_OUTPUT_DIR}" "${ZERO_OUTPUT_DIR}/pgn_dumps"
 
@@ -92,10 +96,9 @@ if compgen -G "${ZERO_OUTPUT_DIR}/weights_iter_*.pt" > /dev/null; then
   HAS_LOCAL_CKPT=1
 fi
 
-# Wipe replay only on a true Run #3 cold start (no local checkpoints yet).
-# Mid-session restarts keep the replay window so the train buffer survives.
+# Wipe replay only on a true Run #4 cold start (no local checkpoints yet).
 if [[ "${HAS_LOCAL_CKPT}" -eq 0 ]]; then
-  echo "Cold start: wiping replay/ for a clean Run #3 buffer."
+  echo "Cold start: wiping replay/ for a clean Run #4 buffer."
   rm -rf "${ZERO_OUTPUT_DIR}/replay"
 fi
 mkdir -p "${ZERO_OUTPUT_DIR}/replay"
@@ -104,11 +107,12 @@ if [[ "${HAS_LOCAL_CKPT}" -eq 0 ]]; then
   if [[ -z "${RESUME_PATH}" || ! -e "${RESUME_PATH}" ]]; then
     echo "Seed checkpoint not found under ${KAGGLE_INPUT}." >&2
     echo "Mount the Run #2 output or set ZERO_RESUME_FROM / ZERO_SEED_WEIGHTS." >&2
+    echo "Do NOT seed from the Run #3 canary (mate skill already wiped)." >&2
     exit 2
   fi
   echo "Seeding from: ${RESUME_PATH}"
 else
-  echo "Resuming local Run #3 checkpoints in ${ZERO_OUTPUT_DIR} (seed ignored by pipeline)."
+  echo "Resuming local Run #4 checkpoints in ${ZERO_OUTPUT_DIR} (seed ignored by pipeline)."
 fi
 
 RESUME_ARGS=()
@@ -125,4 +129,8 @@ python -m tabula.pipeline \
   --simulations "${ZERO_SIMULATIONS}" \
   --arena-games "${ZERO_ARENA_GAMES:-0}" \
   --mate-exam-every "${ZERO_MATE_EXAM_EVERY:-50}" \
-  --max-game-error-rate "${ZERO_MAX_GAME_ERROR_RATE:-0.20}"
+  --max-game-error-rate "${ZERO_MAX_GAME_ERROR_RATE:-0.20}" \
+  --curriculum-gate \
+  --curriculum-unlock-up "${ZERO_CURRICULUM_UNLOCK_UP}" \
+  --curriculum-drop-down "${ZERO_CURRICULUM_DROP_DOWN}" \
+  --curriculum-unlock-streak "${ZERO_CURRICULUM_UNLOCK_STREAK}"

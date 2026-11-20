@@ -62,6 +62,7 @@ class SelfPlayWorker:
         self.last_telemetry = None
         self.last_pgn = None
         self.last_tier = None
+        self.curriculum_weights = None
 
     def play_game(
         self,
@@ -71,14 +72,16 @@ class SelfPlayWorker:
         hold=0.0,
         practice=False,
         tier: int | None = None,
+        weights: dict[int, float] | None = None,
     ):
         """Play one curriculum game; every ply is a full noisy search.
 
-        `practice` is accepted for call-site compatibility. Run #3 always samples
-        from the 4-tier piece staircase (tier 4 = standard start).
+        `practice` is accepted for call-site compatibility. Run #4 samples from
+        the gated piece staircase (tier weights from the curriculum gate).
         """
         del practice
-        start = sample_curriculum_board(tier=tier)
+        mix = weights if weights is not None else getattr(self, "curriculum_weights", None)
+        start = sample_curriculum_board(tier=tier, weights=mix)
         board = start.board
         tier_id = start.tier
         start_pieces = start.piece_count
@@ -262,7 +265,7 @@ def choose_move(root, tau: float):
 
 def _board_to_pgn(board, start_fen, result, termination, tier) -> str:
     game = chess.pgn.Game()
-    game.headers["Event"] = f"Zero Run3 Tier {tier}"
+    game.headers["Event"] = f"Zero Run4 Tier {tier}"
     game.headers["Site"] = "self-play"
     game.headers["FEN"] = start_fen
     game.headers["SetUp"] = "1"

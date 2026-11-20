@@ -31,6 +31,12 @@ from tabula.runtime import (
     utc_now,
 )
 from tabula.hardware.thermal import ThermalGuard
+from tabula.selfplay.curriculum_gate import (
+    DEFAULT_DROP_DOWN,
+    DEFAULT_UNLOCK_STREAK,
+    DEFAULT_UNLOCK_UP,
+    CurriculumGate,
+)
 from tabula.selfplay.labels import repetition_penalty
 from tabula.selfplay.worker import DEFAULT_RES_BLOCKS, DEFAULT_SIMULATIONS, SelfPlayWorker
 from tabula.train.train import DEFAULT_EPOCHS, DEFAULT_MAX_FILES, TrainResult, train
@@ -103,6 +109,7 @@ def run_selfplay_phase(
     *,
     live: LiveBoard | None = None,
     thermal: ThermalGuard | None = None,
+    curriculum_weights: dict[int, float] | None = None,
 ) -> tuple[list[Any], SelfPlayStats, list[str], list[str]]:
     """Run self-play while tolerating a bounded number of game-level failures.
 
@@ -119,6 +126,8 @@ def run_selfplay_phase(
     allowed_errors = _allowed_game_errors(games, max_game_error_rate)
     mate_pgns: list[str] = []
     draw_pgns: list[str] = []
+    if curriculum_weights is not None:
+        worker.curriculum_weights = curriculum_weights
 
     for game_index in range(games):
         stats.games_attempted += 1
@@ -126,7 +135,7 @@ def run_selfplay_phase(
         try:
             if thermal is not None:
                 thermal.check_and_cool()
-            data = worker.play_game(live=live)
+            data = worker.play_game(live=live, weights=curriculum_weights)
         except Exception as exc:
             stats.game_errors += 1
             error_traceback = traceback.format_exc()
@@ -299,6 +308,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--snapshot-every", type=int, default=25)
     parser.add_argument("--min-free-gb", type=float, default=2.0)
     parser.add_argument(
+        "--curriculum-gate",
+        dest="curriculum_gate",
+        action="store_true",
+        default=True,
+        help="Run #4 bidirectional tier gate (default on)",
+    )
+    parser.add_argument(
+        "--no-curriculum-gate",
+        dest="curriculum_gate",
+        action="store_false",
+        help="Use the legacy flat 20/45/25/10 tier mix",
+    )
+    parser.add_argument(
+        "--curriculum-unlock-up",
+        type=int,
+        default=int(os.environ.get("ZERO_CURRICULUM_UNLOCK_UP", DEFAULT_UNLOCK_UP)),
+        help="Mate-exam mates/20 required to unlock the next tier",
+    )
+    parser.add_argument(
+        "--curriculum-drop-down",
+        type=int,
+        default=int(os.environ.get("ZERO_CURRICULUM_DROP_DOWN", DEFAULT_DROP_DOWN)),
+        help="Mate-exam mates/20 at or below which the gate drops a tier",
+    )
+    parser.add_argument(
+        "--curriculum-unlock-streak",
+        type=int,
+        default=int(os.environ.get("ZERO_CURRICULUM_UNLOCK_STREAK", DEFAULT_UNLOCK_STREAK)),
+        help="Consecutive exams at unlock-up before raising max tier",
+    )
+    parser.add_argument(
         "--resume-from",
         default=None,
         help="Checkpoint file or run directory to resume (defaults to newest in --output-dir)",
@@ -337,6 +377,12 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("snapshot_every must be positive")
     if args.min_free_gb < 0:
         raise ValueError("min_free_gb cannot be negative")
+    if args.curriculum_unlock_streak < 1:
+        raise ValueError("curriculum_unlock_streak must be positive")
+    if not 0 <= args.curriculum_drop_down < args.curriculum_unlock_up <= 20:
+        raise ValueError(
+            "need 0 <= curriculum_drop_down < curriculum_unlock_up <= 20"
+        )
     paths = RunPaths.from_value(args.output_dir)
     paths.ensure()
     if not _storage_ready(
@@ -362,6 +408,17 @@ def run(args: argparse.Namespace) -> int:
     final_iteration = iteration + args.iterations - 1
     model_path = _seed_weights(paths, checkpoint)
 
+    prior_gate = None
+    if checkpoint is not None:
+        prior_gate = (checkpoint.get("metadata") or {}).get("curriculum_gate")
+    gate = CurriculumGate.from_state(
+        prior_gate,
+        enabled=bool(args.curriculum_gate),
+        unlock_up=args.curriculum_unlock_up,
+        drop_down=args.curriculum_drop_down,
+        unlock_streak_needed=args.curriculum_unlock_streak,
+    )
+
     thermal = ThermalGuard()
     budget = WallClockBudget(args.time_limit_hours)
     previous_iteration_seconds: float | None = None
@@ -371,6 +428,12 @@ def run(args: argparse.Namespace) -> int:
     print(f"Output: {paths.root}")
     print(f"MCTS simulations: {args.simulations}")
     print(f"Repetition penalty: {repetition_penalty():+.2f}")
+    print(
+        f"Curriculum gate: {'ON' if gate.enabled else 'OFF'} | "
+        f"max_tier={gate.max_tier} | unlock>={gate.unlock_up}/20 "
+        f"x{gate.unlock_streak_needed} | drop<={gate.drop_down}/20 | "
+        f"weights={gate.weights()}"
+    )
     if checkpoint_path is not None:
         print(
             f"Resuming from {checkpoint_path} at iteration {iteration} "
@@ -412,6 +475,7 @@ def run(args: argparse.Namespace) -> int:
                     num_simulations=args.simulations,
                     num_res_blocks=DEFAULT_RES_BLOCKS,
                 )
+                curriculum_weights = gate.weights()
                 replay, stats, mate_pgns, draw_pgns = run_selfplay_phase(
                     worker,
                     args.games,
@@ -420,6 +484,7 @@ def run(args: argparse.Namespace) -> int:
                     paths.metrics_path,
                     live=live,
                     thermal=thermal,
+                    curriculum_weights=curriculum_weights,
                 )
                 atomic_torch_save(replay, paths.replay_path(iteration))
                 if args.mate_exam_every and iteration % args.mate_exam_every == 0:
@@ -446,11 +511,29 @@ def run(args: argparse.Namespace) -> int:
 
                 candidate_path = paths.root / f".candidate_iter_{iteration:04d}.pt"
                 atomic_torch_save(result.model.state_dict(), candidate_path)
+                gate_event: dict[str, Any] | None = None
                 if args.mate_exam_every and iteration % args.mate_exam_every == 0:
-                    run_mate_exam(
+                    exam_summary = run_mate_exam(
                         str(candidate_path),
                         num_simulations=args.simulations,
                         out_path=str(paths.root / f"mate_exam_iter_{iteration:04d}.json"),
+                    )
+                    gate_event = gate.update_from_exam(
+                        exam_summary["mates"],
+                        exam_summary["n"],
+                    )
+                    gate_event["iteration_idx"] = iteration
+                    _log_record(
+                        paths.metrics_path,
+                        gate_event["event"],
+                        **{k: v for k, v in gate_event.items() if k != "event"},
+                    )
+                    print(
+                        f"Curriculum gate: exam {exam_summary['mates']}/"
+                        f"{exam_summary['n']} → {gate_event['action']} | "
+                        f"max_tier {gate_event['max_tier_before']}→"
+                        f"{gate_event['max_tier_after']} | "
+                        f"weights={gate.weights()}"
                     )
                 promoted = not paths.champion_weights.exists()
                 arena_metrics: dict[str, Any] = {
@@ -501,6 +584,10 @@ def run(args: argparse.Namespace) -> int:
                     peak_memory,
                     arena_metrics,
                 )
+                metrics["curriculum_max_tier"] = gate.max_tier
+                metrics["curriculum_weights"] = gate.weights()
+                if gate_event is not None:
+                    metrics["curriculum_gate_action"] = gate_event["action"]
                 payload = checkpoint_payload(
                     iteration=iteration,
                     model_state=result.model.state_dict(),
@@ -511,6 +598,7 @@ def run(args: argparse.Namespace) -> int:
                         "config": vars(args),
                         "selfplay": asdict(stats),
                         "repetition_penalty": repetition_penalty(),
+                        "curriculum_gate": gate.to_state(),
                     },
                 )
 

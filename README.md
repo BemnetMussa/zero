@@ -70,20 +70,23 @@ PYTHONPATH=src .venv/bin/python -m tabula.pipeline \
 
 No tablebase is needed or read during training.
 
-For an overnight Kaggle session (Run #2 defaults):
+For a Kaggle session (Run #4 gated curriculum):
 
 ```bash
 bash scripts/kaggle_overnight.sh
 ```
 
-The launcher defaults to 7.5 hours, `/kaggle/working/checkpoints`, 128 simulations,
-`TABULA_REPETITION_PENALTY=-0.20`, and seeds from Run #1's
-`/kaggle/input/zero-model/checkpoints/weights_iter_0969.pt`. Override those with
-`ZERO_TIME_LIMIT_HOURS`, `ZERO_OUTPUT_DIR`, `ZERO_SIMULATIONS`,
-`TABULA_REPETITION_PENALTY`, and `ZERO_RESUME_FROM`. Checkpoints already in the
-output directory win over the seed, so re-running the same command after a
-restart continues from the newest complete checkpoint instead of rewinding.
-The seed checkpoint is only read; Run #1's files are never written.
+Defaults: **4.5 h** canary, `/kaggle/working/checkpoints`, 128 simulations,
+`TABULA_REPETITION_PENALTY=-0.20`, curriculum gate on (unlock ≥16/20 twice,
+drop ≤12/20), warm-start from **Run #2** weights under `/kaggle/input`
+(or `ZERO_RESUME_FROM`). Do **not** seed from the Run #3 canary.
+
+Override with `ZERO_TIME_LIMIT_HOURS`, `ZERO_OUTPUT_DIR`, `ZERO_SIMULATIONS`,
+`TABULA_REPETITION_PENALTY`, `ZERO_RESUME_FROM`, `ZERO_CURRICULUM_UNLOCK_UP`,
+`ZERO_CURRICULUM_DROP_DOWN`, `ZERO_CURRICULUM_UNLOCK_STREAK`. Checkpoints
+already in the output directory win over the seed, so re-running after a
+restart continues from the newest complete checkpoint. Overnight only if the
+mate exam holds after the canary.
 
 Useful flags:
 

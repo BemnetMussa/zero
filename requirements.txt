@@ -1,0 +1,4 @@
+# Kaggle / pip convenience mirror of pyproject.toml
+numpy
+python-chess
+torch

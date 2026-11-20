@@ -4,7 +4,13 @@
 # Default: ~4.5 h canary. Overnight only if the exam holds.
 set -euo pipefail
 
-export PYTHONPATH="${PYTHONPATH:-src}"
+# Always resolve package root from this script (Kaggle often has PYTHONPATH preset).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
 export ZERO_OUTPUT_DIR="${ZERO_OUTPUT_DIR:-/kaggle/working/checkpoints}"
 export TABULA_REPETITION_PENALTY="${TABULA_REPETITION_PENALTY:--0.20}"
 ZERO_SIMULATIONS="${ZERO_SIMULATIONS:-128}"
@@ -40,7 +46,7 @@ pick_newest_iter_checkpoint() {
 }
 
 resolve_seed() {
-  # 1) Explicit path
+  # 1) Explicit path (best — pin Run #2 end weights yourself)
   if [[ -n "${ZERO_RESUME_FROM}" && -e "${ZERO_RESUME_FROM}" ]]; then
     echo "${ZERO_RESUME_FROM}"
     return 0
@@ -49,7 +55,14 @@ resolve_seed() {
     return 1
   fi
 
-  # 2) Prefer a unique latest_weights.pt under /kaggle/input (newest mtime if many)
+  # 2) Highest weights_iter_XXXX.pt under /kaggle/input (prefer numbered over latest_)
+  local best=""
+  if best="$(pick_newest_iter_checkpoint "${KAGGLE_INPUT}")"; then
+    echo "$best"
+    return 0
+  fi
+
+  # 3) Fall back to latest_weights.pt (newest mtime if many)
   mapfile -t latests < <(find "${KAGGLE_INPUT}" -type f -name 'latest_weights.pt' 2>/dev/null | sort)
   if [[ ${#latests[@]} -eq 1 ]]; then
     echo "${latests[0]}"
@@ -63,13 +76,6 @@ resolve_seed() {
       return 0
     fi
   fi
-
-  # 3) Highest weights_iter_XXXX.pt anywhere under /kaggle/input
-  local best=""
-  if best="$(pick_newest_iter_checkpoint "${KAGGLE_INPUT}")"; then
-    echo "$best"
-    return 0
-  fi
   return 1
 }
 
@@ -81,6 +87,9 @@ else
 fi
 
 echo "=== Tabula Run #4 launcher (gated curriculum) ==="
+echo "REPO_ROOT=${REPO_ROOT}"
+echo "PYTHONPATH=${PYTHONPATH}"
+echo "PYTHON_BIN=${PYTHON_BIN}"
 echo "ZERO_OUTPUT_DIR=${ZERO_OUTPUT_DIR}"
 echo "ZERO_SIMULATIONS=${ZERO_SIMULATIONS}"
 echo "ZERO_GAMES=${ZERO_GAMES}"
@@ -120,7 +129,7 @@ if [[ "${HAS_LOCAL_CKPT}" -eq 0 && -n "${RESUME_PATH}" && -e "${RESUME_PATH}" ]]
   RESUME_ARGS=(--resume-from "${RESUME_PATH}")
 fi
 
-python -m tabula.pipeline \
+"${PYTHON_BIN}" -m tabula.pipeline \
   --no-tui \
   --output-dir "${ZERO_OUTPUT_DIR}" \
   "${RESUME_ARGS[@]}" \
